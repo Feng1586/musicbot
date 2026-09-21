@@ -182,8 +182,13 @@ def main() -> int:
     print("5. 以「客户 compose 的写法」起容器（6 个环境变量 + 卷映射）")
     env = load_env()
     run([DOCKER, "rm", "-f", CONTAINER])
-    host_dl = os.path.join(ROOT, ".wb_s8_downloads")
-    host_data = os.path.join(ROOT, ".wb_s8_data")
+    # ⚠️ 临时映射目录必须放在**项目目录之外**。
+    # 放在 ROOT 里会被 `COPY . .` 带进镜像 —— v1.0.2 实际发生过：
+    # 构建出的镜像里出现了 /app/.wb_s8_data/cookie_state.json。
+    # （.dockerignore 里也补了 `.wb_*` 兜底，但根因是别把临时物建在构建上下文里。）
+    outside = os.path.dirname(ROOT)
+    host_dl = os.path.join(outside, ".wb_s8_downloads")
+    host_data = os.path.join(outside, ".wb_s8_data")
     os.makedirs(host_dl, exist_ok=True)
     os.makedirs(host_data, exist_ok=True)
     r = run([DOCKER, "run", "-d", "--name", CONTAINER,
