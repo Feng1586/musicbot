@@ -7,6 +7,10 @@ downloads/
 logs/
 *.log
 
+# 测试产生的临时目录/文件（s8_check 会建映射目录等）
+.wb_*
+.wb-*
+
 # Python
 __pycache__/
 *.py[cod]
