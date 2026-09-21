@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -36,10 +37,41 @@ PORT = 18002
 # 期望的 manifest digest。每次发布都会变，所以从环境变量读；不传就跳过这一项：
 #   WB_EXPECT_DIGEST=sha256:xxxx python tests/s8_check.py
 EXPECT_DIGEST = os.environ.get("WB_EXPECT_DIGEST", "")
-# 这些是真正的凭据值，镜像里绝不能出现。
-# 注意不要放「字段名」（如 MUSIC_U）—— 那是代码里本来就有的键名，不是凭据。
-SENSITIVE = ["qHiJCbw4", "zSaPfhO6", "1CPKUYR6", "wwd52b9b68a7d192fe",
-             "zd.i-am-a.gay", "27417187", "秋枫"]
+
+
+def sensitive_tokens() -> list[str]:
+    """要从镜像里确认「不存在」的凭据片段。
+
+    ⚠️ **这些值绝不能硬编码在源码里。** v1.0.1 那版就是把它们写死在
+    一个 `SENSITIVE = [...]` 列表里，而 `tests/` 又被 `COPY . .` 带进了镜像，
+    于是校验脚本自己命中了这些字面量 —— **检查清单本身成了泄露源**。
+
+    现在改成运行时从 `.env` 现取（`.env` 本来就被 `.dockerignore` 排除），
+    源码里只留「取哪几个字段、取多少位」。顺带说明：
+    别把「字段名」放进来（如前面那个 MUSIC_U）—— 那是代码里本来就有的键名。
+    """
+    env = load_env()
+    tokens: list[str] = []
+    # 三个凭据各取前 8 位：够长到不会误命中，又不需要把整个密钥搬进来
+    for key in ("STOKEN", "S_ENCODING_AES_KEY", "SECRET"):
+        value = env.get(key, "")
+        if len(value) >= 8:
+            tokens.append(value[:8])
+    if env.get("S_CORP_ID"):
+        tokens.append(env["S_CORP_ID"])
+    # 反代主机名 / QQ 账号也从运行时的值里取，不写死
+    match = re.match(r"https?://([^/:]+)", env.get("WECHAT_PROXY", ""))
+    if match:
+        tokens.append(match.group(1))
+    cookie_file = os.path.join(ROOT, "data", "cookies", "qq.json")
+    try:
+        with open(cookie_file, encoding="utf-8") as fp:
+            account = str(json.load(fp).get("account") or "").strip()
+        if account:
+            tokens.append(account)
+    except (OSError, ValueError):
+        pass
+    return tokens
 
 results: list[tuple[str, bool, str]] = []
 
@@ -138,9 +170,13 @@ def main() -> int:
           inside("find /app/data -type f 2>/dev/null | head -3"))
     check("镜像内没有 cookies/*.json",
           inside("ls /app/data/cookies/*.json 2>/dev/null | wc -l") == "0")
-    for token in SENSITIVE:
+    # 注意：检查项的名字里**不能出现完整凭据** —— 测试日志本身也会被留下/被读到。
+    # 这里只显示前三位的打码形式，够定位是哪个字段即可。
+    tokens = sensitive_tokens()
+    print(f"  （本次检查 {len(tokens)} 个凭据片段，日志中一律打码）")
+    for token in tokens:
         found = inside(f"grep -rl '{token}' /app 2>/dev/null | wc -l")
-        check(f"不含字面量 {token}", found == "0", found)
+        check(f"不含凭据片段 {token[:3]}***", found == "0", found)
 
     print()
     print("5. 以「客户 compose 的写法」起容器（6 个环境变量 + 卷映射）")

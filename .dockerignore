@@ -26,6 +26,15 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 
+# 测试脚本不进镜像。
+# 它们只在宿主机跑，容器里毫无用处；更重要的是它们会写
+# 「要从镜像里确认不存在的凭据片段」这类检查清单 ——
+# 一旦打进镜像，校验脚本就会自己命中自己，看起来像凭据泄露。
+# （v1.0.1 实际踩过：/app/tests/s8_check.py 里的 SENSITIVE 清单被扫了出来）
+tests/
+run.ps1
+run.bat
+
 # 文档（不影响运行，减小构建上下文）
 *.md
 !README.md
