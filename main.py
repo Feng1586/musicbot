@@ -60,7 +60,12 @@ def _source_summary() -> str:
 
 
 def _send_startup_messages() -> None:
-    """启动广播（一条）+ Cookie 体检（另一条）。用户明确要求分开两条。"""
+    """启动广播（一条）+ Cookie 体检（另一条）。用户明确要求分开两条。
+
+    这两条可以用 `MUSICBOT_STARTUP_BROADCAST=false` 关掉：客户容器被
+    watchtower 拉起就会广播一轮，有人会觉得吵。**Cookie 失效告警不受它影响** ——
+    那条是「需要用户动手」的消息，不该被静音。
+    """
     try:
         from app import notices
         engine_name = SOURCE_META[settings.default_source]['name']
@@ -71,6 +76,10 @@ def _send_startup_messages() -> None:
         except Exception as e:
             logger.warning('启动时检查 Cookie 失败：%s', e)
             status_lines = ['（Cookie 状态检查失败）']
+
+        if not settings.startup_broadcast:
+            logger.info('启动广播已关闭（MUSICBOT_STARTUP_BROADCAST），Cookie 失效告警仍然照发')
+            return
 
         update_line = ''
         try:

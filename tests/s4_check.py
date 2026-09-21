@@ -245,19 +245,25 @@ def part_login_manager() -> None:
     images: list[int] = []
 
     manager.send_text = lambda text, user, **kw: (sent.append(text), True)[1]  # type: ignore
-    manager.send_image = lambda data, user, **kw: (images.append(len(data)), True)[1]  # type: ignore
+    # 二维码这条路现在分两步（先上传素材探路，再发图片消息），所以要分别打桩
+    manager.upload_media = lambda data, **kw: (images.append(len(data)), 'MID')[1]  # type: ignore
+    manager.send_image_message = lambda media_id, user, **kw: True  # type: ignore
     manager.QRCODE_TIMEOUT_MINUTES = 0.05          # 3 秒就超时，别真等 5 分钟
     manager.POLL_INTERVAL_SECONDS = 0.5
+
+    def wait_session(source: str, seconds: float = 25) -> None:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if not manager.session_of(source).running:
+                return
+            time.sleep(0.2)
 
     ok, message = manager.start_login('qq', 'tester')
     check('E1 发起登录被接受', ok is True, message)
     ok2, message2 = manager.start_login('qq', 'tester')
     check('E2 同一源重复发起被拒绝', ok2 is False, message2)
 
-    for _ in range(80):
-        if not manager.session_of('qq').running:
-            break
-        time.sleep(0.2)
+    wait_session('qq')
 
     session = manager.session_of('qq')
     check('E3 超时后状态为 failed', session.status == manager.STATUS_FAILED,
@@ -270,6 +276,42 @@ def part_login_manager() -> None:
           [t[:30] for t in sent])
     check('E7 网页接口能拿到二维码', len(manager.qrcode_png('qq')) > 100,
           f'{len(manager.qrcode_png("qq"))} 字节')
+
+    # --- E8 / E9：二维码图片发不出去时的降级 -----------------------------------
+    # 这正是当前部署的真实处境：反代没放行 /cgi-bin/media/upload。
+    # 旧写法会先说「二维码图片见下一条消息」，然后图片发不出去、什么都不补 ——
+    # 用户就干等一条永远不会来的消息。
+    from app.config import settings
+
+    def failing_upload(data, **kw):
+        raise RuntimeError('media/upload 失败: errcode=404（反代未放行）')
+
+    manager.upload_media = failing_upload  # type: ignore
+    saved_base = settings.public_base_url
+
+    # E8 没配对外地址 → 应该说清原因，而不是留下一句空头承诺
+    settings.public_base_url = ''
+    sent.clear()
+    ok8, _ = manager.start_login('wyy', 'tester')
+    check('E8 图片不可用时仍能发起登录', ok8 is True)
+    wait_session('wyy')
+    joined = '\n'.join(sent)
+    check('E8 不再承诺「二维码图片见下一条消息」', '见下一条消息' not in joined,
+          [t[:36] for t in sent])
+    check('E8 说清了图片发不出去', '没能发出来' in joined, [t[:36] for t in sent])
+    check('E8 给出了可用的兜底入口',
+          ('局域网' in joined) or ('请联系管理员' in joined), [t[:36] for t in sent])
+
+    # E9 配了对外地址 → 必须把链接给出来
+    settings.public_base_url = 'https://example.com'
+    sent.clear()
+    ok9, _ = manager.start_login('qq', 'tester')
+    check('E9 有对外地址时能发起登录', ok9 is True)
+    wait_session('qq')
+    joined9 = '\n'.join(sent)
+    check('E9 说明里带了扫码页链接', 'https://example.com/login/qq' in joined9,
+          [t[:44] for t in sent])
+    settings.public_base_url = saved_base
 
 
 def part_updater() -> None:

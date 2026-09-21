@@ -25,10 +25,17 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"
     os.environ.pop(_k, None)
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
 
-IMAGE = "66211900/wecom-musicbot:1.0.0"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import read_version                           # noqa: E402
+
+BOT_VERSION = read_version()
+
+IMAGE = f"66211900/wecom-musicbot:{BOT_VERSION}"
 CONTAINER = "wb-musicbot-check"
 PORT = 18002
-EXPECT_DIGEST = "sha256:00ea1ebaaa314fb43c6ca92335ff26a9733c50f5afd717e4ae920061e346ab43"
+# 期望的 manifest digest。每次发布都会变，所以从环境变量读；不传就跳过这一项：
+#   WB_EXPECT_DIGEST=sha256:xxxx python tests/s8_check.py
+EXPECT_DIGEST = os.environ.get("WB_EXPECT_DIGEST", "")
 # 这些是真正的凭据值，镜像里绝不能出现。
 # 注意不要放「字段名」（如 MUSIC_U）—— 那是代码里本来就有的键名，不是凭据。
 SENSITIVE = ["qHiJCbw4", "zSaPfhO6", "1CPKUYR6", "wwd52b9b68a7d192fe",
@@ -76,14 +83,19 @@ def main() -> int:
         with urllib.request.urlopen(req, timeout=30) as r:
             tags = json.loads(r.read().decode())
         names = {t["name"]: t for t in tags["results"]}
-        check("远端已有 1.0.0 与 latest", "1.0.0" in names and "latest" in names,
-              list(names))
-        if "1.0.0" in names:
-            t = names["1.0.0"]
+        check(f"远端已有 {BOT_VERSION} 与 latest",
+              BOT_VERSION in names and "latest" in names, list(names))
+        if BOT_VERSION in names:
+            t = names[BOT_VERSION]
             archs = sorted({i["architecture"] + "/" + i["os"] for i in t.get("images", [])})
             check("双架构", set(archs) == {"amd64/linux", "arm64/linux"}, archs)
-            check("digest 与推送一致", t.get("digest", "").startswith("sha256:00ea1eba"),
-                  t.get("digest", ""))
+            if EXPECT_DIGEST:
+                check("digest 与推送记录一致",
+                      t.get("digest", "").startswith(EXPECT_DIGEST[:26]),
+                      t.get("digest", ""))
+            else:
+                check("远端 digest（未传 WB_EXPECT_DIGEST，仅记录）", True,
+                      t.get("digest", "")[:28])
     except Exception as e:
         check("查询 Docker Hub", False, repr(e))
 
@@ -94,9 +106,9 @@ def main() -> int:
 
     print()
     print("3. 镜像内容")
-    check("版本号 = 1.0.0",
+    check(f"版本号 = {BOT_VERSION}",
           inside("python -c 'from utils.version import __version__;print(__version__)'")
-          == "1.0.0")
+          == BOT_VERSION)
     for path, name in (("app/crypto.py", "回调加解密"),
                        ("app/sources.py", "引擎"),
                        ("app/cookies.py", "Cookie 管理"),
@@ -163,7 +175,7 @@ def main() -> int:
     logs = run([DOCKER, "logs", CONTAINER])
     log_text = (logs.stdout or "") + (logs.stderr or "")
     check("日志显示版本与配置检查通过",
-          "musicbot v1.0.0 启动中" in log_text and "引擎与下载队列就绪" in log_text,
+          f"musicbot v{BOT_VERSION} 启动中" in log_text and "引擎与下载队列就绪" in log_text,
           [l for l in log_text.splitlines() if "启动中" in l][:1])
     check("日志无 Traceback", "Traceback" not in log_text)
 

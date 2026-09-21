@@ -275,7 +275,11 @@ def main() -> int:
         print('-' * 72)
         with urllib.request.urlopen(f'{base}/') as r:
             page = r.read().decode()
-        check('状态页 200 且含版本', 'musicbot' in page and 'v1.0.0' in page)
+        # 版本号从文件读，不走 import（原因见 tests/_common.py 的说明）
+        from _common import read_version
+
+        check('状态页 200 且含版本',
+              'musicbot' in page and f'v{read_version()}' in page)
 
         with urllib.request.urlopen(f'{base}/login/qq') as r:
             html = r.read().decode()

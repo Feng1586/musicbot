@@ -206,6 +206,12 @@ def part_bc(env: dict[str, str]) -> None:
     print('B/C. 起真实服务 + mock 企微，走完整回调链路')
     print('=' * 72)
 
+    # 版本号从文件读，不走 import —— 原因见 tests/_common.py 的说明
+    # （工作区里旧项目也有个顶层 utils 包，import 会撞名）
+    from _common import read_version
+
+    bot_version = read_version()
+
     start_mock()
     child_env = dict(os.environ)
     child_env.update({
@@ -213,6 +219,10 @@ def part_bc(env: dict[str, str]) -> None:
         'MUSICBOT_HOST': '127.0.0.1',
         'MUSICBOT_PORT': str(APP_PORT),
         'MUSICBOT_DEFAULT_SOURCE': 'qq',
+        # 关掉启动广播与 Cookie 体检：这两条后台线程发的 @all 消息会混进
+        # mock 记录，让 C 段「发了几条、发给谁」的断言随机失败。
+        # 启动广播本身由 e2e_check.py 负责验证。
+        'MUSICBOT_STARTUP_BROADCAST': 'false',
         'PYTHONIOENCODING': 'utf-8',
         'PYTHONUTF8': '1',
     })
@@ -229,7 +239,10 @@ def part_bc(env: dict[str, str]) -> None:
 
         with urllib.request.urlopen(f'{base}/') as resp:
             page = resp.read().decode('utf-8')
-        check('B2 状态页 200 且含版本号', 'musicbot' in page and 'v1.0.0' in page)
+        check('B2 状态页 200 且含版本号',
+              'musicbot' in page and f'v{bot_version}' in page,
+              f'页面 {len(page)} 字节，期望 v{bot_version}，'
+              f'含 musicbot={"musicbot" in page}')
 
         crypto = WeComCrypto(env['STOKEN'], env['S_ENCODING_AES_KEY'], env['S_CORP_ID'])
         ts, nonce = str(int(time.time())), 'wbnonce'
@@ -302,16 +315,24 @@ def part_bc(env: dict[str, str]) -> None:
 
         sent_texts = [s['json'].get('text', {}).get('content', '') for s in sends]
         joined = '\n'.join(sent_texts)
-        check('C3 /version 的回复内容正确', 'musicbot v1.0.0' in joined,
-              sent_texts[0][:40] if sent_texts else '(无)')
-        if sends:
-            payload = sends[0]['json']
+        check('C3 /version 的回复内容正确', f'musicbot v{bot_version}' in joined,
+              f'期望 v{bot_version}；收到的文本={[t[:36] for t in sent_texts]}')
+
+        # 只看「发给发消息那个人」的：@all 是广播，不该混进这里的断言。
+        # （上面已经用 MUSICBOT_STARTUP_BROADCAST=false 关了启动广播，
+        #  但保留这层过滤，免得以后有人改回默认值时又变成偶发失败。）
+        replies = [s for s in sends if s['json'].get('touser') != '@all']
+        if replies:
+            payload = replies[0]['json']
             check('C4 收件人、msgtype、agentid 正确',
                   payload.get('touser') == 'wb_test_user'
                   and payload.get('msgtype') == 'text'
                   and payload.get('agentid') == int(env['AGENT_ID']),
                   f"touser={payload.get('touser')} agentid={payload.get('agentid')}")
-            check('C5 事件消息没有触发发送', len(sends) == 1, f'{len(sends)} 条')
+        else:
+            check('C4 收件人、msgtype、agentid 正确', False, '没有发给测试用户的回复')
+        check('C5 只回了一条给发消息的人（事件消息没有触发发送）',
+              len(replies) == 1, f'发给测试用户 {len(replies)} 条，总 {len(sends)} 条')
 
         # B7 日志不重复（旧项目同一行打两遍）
         log_file.flush()
@@ -332,6 +353,13 @@ def main() -> int:
     print()
     env = load_env()
     part_a(env)
+    # part_a 为了让旧项目的 SDK 参与交叉验证，把 `musicdl/` 的根目录插进了 sys.path。
+    # 那边**也有一个顶层 `utils` 包**（版本号是旧机器人的 1.2.0）。如果留着它，
+    # 之后第一次 `import utils` 就会解析到旧项目去 —— 这个坑实际踩过一次：
+    # 版本断言拿到 1.2.0，看起来像服务端版本不对，其实是测试自己导错了包。
+    from _common import drop_from_sys_path
+
+    drop_from_sys_path(SDK_ROOT)
     part_bc(env)
 
     print()

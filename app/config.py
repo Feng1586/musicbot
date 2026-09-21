@@ -98,6 +98,11 @@ class Settings:
         self.log_level = _env_str('MUSICBOT_LOG_LEVEL', 'INFO').upper()
         self.pip_index_url = _env_str('PIP_INDEX_URL', DEFAULT_PIP_INDEX)
         self.image_enabled = _env_str('MUSICBOT_IMAGE_ENABLED', 'true').lower() not in ('0', 'false', 'no')
+        # 启动时那两条广播（使用教程 + Cookie 体检）。留在这里是因为
+        # 客户容器会被 watchtower 反复拉起，而每次拉起都会广播一轮；
+        # 想安静更新的部署可以把它关掉，Cookie 失效时仍会单独告警。
+        self.startup_broadcast = (_env_str('MUSICBOT_STARTUP_BROADCAST', 'true')
+                                  .lower() not in ('0', 'false', 'no'))
 
     # ------------------------------------------------------------------
     @property
