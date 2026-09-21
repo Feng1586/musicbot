@@ -1,0 +1,27 @@
+# 依赖全部钉死版本，保证镜像可复现（旧项目吃过 ">=x" 每次构建版本都不同的亏）
+
+# Web 框架
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+
+# 音乐搜索/下载（本项目唯一的业务依赖，歌词/封面/标签都由它内置完成）
+musicdl==2.13.11
+
+# 企微回调加解密（AES-256-CBC）
+pycryptodome==3.23.0
+
+# 扫码登录：生成二维码
+qrcode==8.2
+pillow==12.3.0
+
+# 配置与版本比较
+python-dotenv==1.2.3
+packaging==26.3
+
+# HTTP 与被广泛使用的小工具
+requests==2.34.2
+cachetools==7.2.0
+
+# musicdl 自身声明 cryptography<47，这里显式钉住上界，
+# 避免将来解析到 47+ 时静默破坏 musicdl 的加密相关模块。
+cryptography>=46.0.5,<47

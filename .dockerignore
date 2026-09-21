@@ -1,0 +1,31 @@
+# 子目录规则一律带 **/ 前缀，否则只匹配顶层目录。
+# 旧项目踩过：只写 __pycache__/ 匹配不到 config/__pycache__，
+# 宿主机编译出的 .pyc 把凭据带进了镜像。
+
+# 凭据与运行时数据
+.env
+.env.local
+data/
+downloads/
+logs/
+*.log
+
+# Python 缓存（含子目录）
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 版本控制与构建产物
+.git/
+.gitignore
+.github/
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 文档（不影响运行，减小构建上下文）
+*.md
+!README.md

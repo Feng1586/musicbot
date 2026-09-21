@@ -1,0 +1,16 @@
+# 凭据与运行时数据：绝不入库
+.env
+.env.local
+.env.*.local
+data/
+downloads/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/

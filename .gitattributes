@@ -1,0 +1,15 @@
+# 行尾规范化：shell 脚本一旦被 CRLF 化，容器里会以 bad interpreter 启动失败
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.flac  binary
+*.mp3   binary
+
+# 语言统计时忽略
+data/**      linguist-vendored
+downloads/** linguist-vendored

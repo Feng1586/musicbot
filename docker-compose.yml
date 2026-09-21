@@ -1,0 +1,48 @@
+# musicbot 容器编排
+#
+# 用 docker compose 启动：
+#   1) cp .env.example .env  并填写凭据
+#   2) docker compose up -d
+#
+# 凭据只从 .env 读，缺任何一个都会**直接报错退出**（用 ${VAR:?} 而不是 ${VAR}）——
+# 否则会拿空凭据静默启动，到运行时报一句看不懂的「微信验证失败」。
+
+services:
+  musicbot:
+    image: 66211900/wecom-musicbot:latest
+    # 本机构建时改成：
+    # build: .
+    container_name: musicbot
+    restart: unless-stopped        # 必须：/restart 在没挂 docker.sock 时会退出进程，靠这条拉起
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+
+      # --- 企业微信应用凭据（必填）---
+      - "STOKEN=${STOKEN:?请在 .env 中设置 STOKEN}"
+      - "S_ENCODING_AES_KEY=${S_ENCODING_AES_KEY:?请在 .env 中设置 S_ENCODING_AES_KEY}"
+      - "S_CORP_ID=${S_CORP_ID:?请在 .env 中设置 S_CORP_ID}"
+      - "AGENT_ID=${AGENT_ID:?请在 .env 中设置 AGENT_ID}"
+      - "SECRET=${SECRET:?请在 .env 中设置 SECRET}"
+
+      # --- 可选 ---
+      # 企微 API 入口。能直连官方就用官方；到不了官方时填自己的反代（结尾不要带 /）
+      - "WECHAT_PROXY=${WECHAT_PROXY:-https://qyapi.weixin.qq.com}"
+      # 对外可访问地址（反代域名）。配了之后消息里会附扫码登录链接
+      - "MUSICBOT_PUBLIC_BASE_URL=${MUSICBOT_PUBLIC_BASE_URL:-}"
+      - "MUSICBOT_DEFAULT_SOURCE=${MUSICBOT_DEFAULT_SOURCE:-qq}"
+      - "MUSICBOT_SEARCH_LIMIT=${MUSICBOT_SEARCH_LIMIT:-8}"
+      - "MUSICBOT_RESULT_CACHE_MINUTES=${MUSICBOT_RESULT_CACHE_MINUTES:-5}"
+      - "MUSICBOT_COOKIE_CHECK_INTERVAL_MINUTES=${MUSICBOT_COOKIE_CHECK_INTERVAL_MINUTES:-30}"
+      - "MUSICBOT_LOG_LEVEL=${MUSICBOT_LOG_LEVEL:-INFO}"
+      - "MUSICBOT_IMAGE_ENABLED=${MUSICBOT_IMAGE_ENABLED:-true}"
+
+    volumes:
+      # 下载的音乐（按源/批次分目录）
+      - ./downloads:/app/downloads
+      # Cookie 与状态：**一定要持久化**，否则重建容器就要重新扫码登录
+      - ./data:/app/data
+      # 可选：想用 /restart 直接重启容器（而不是退出进程靠 restart 策略拉起）就打开这行。
+      # 不映射也能用，只是 /restart 会退化成「退出进程」。
+      # - /var/run/docker.sock:/var/run/docker.sock
