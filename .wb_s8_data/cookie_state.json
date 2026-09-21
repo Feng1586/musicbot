@@ -1,0 +1,16 @@
+{
+  "qq": {
+    "state": "fail",
+    "notified": true,
+    "reason": "未登录（本地没有 Cookie）",
+    "account": "",
+    "checked_at": 1790015322.017734
+  },
+  "wyy": {
+    "state": "fail",
+    "notified": true,
+    "reason": "未登录（本地没有 Cookie）",
+    "account": "",
+    "checked_at": 1790015322.045516
+  }
+}
