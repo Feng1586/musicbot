@@ -313,6 +313,64 @@ def part_login_manager() -> None:
           [t[:44] for t in sent])
     settings.public_base_url = saved_base
 
+    # --- E10~E13：成功路径（v1.0.4 回归）--------------------------------------
+    # 线上事故：成功分支里的 `_set(..., account=...)` 签名不匹配，后台登录线程直接崩，
+    # 结果是 Cookie 明明已落盘，但引擎没重建、成功通知没发、会话还卡在 scanned 态
+    # （用户再也发不起登录）。下面的用例专门盯住成功路径，缺了它这类 bug 抓不到。
+    def wait_finished(source: str, seconds: float = 25) -> None:
+        """等登录线程**彻底跑完**。
+
+        不能只用 wait_session(`running`) —— 会话状态在 `_set(status=success)` 那一刻
+        就翻成 success 了，而「重建引擎 / 发成功通知」还排在它后面；此时断言会读得太早。
+        `finished_at` 是在 finally 里、所有收尾动作之后才写的，等它才没有竞态。
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if manager.session_of(source).finished_at:
+                return
+            time.sleep(0.05)
+
+    orig_login_qq = manager._login_qq
+    orig_send_text = manager.send_text
+    rebuilt: list[int] = []
+
+    def fake_login_qq(session, user):
+        return True, '', '测试账号', 0
+
+    manager._login_qq = fake_login_qq
+    sent.clear()
+    ok10, _ = manager.start_login('qq', 'tester', on_success=lambda: rebuilt.append(1))
+    check('E10 成功路径能发起登录', ok10 is True)
+    wait_finished('qq')
+    s10 = manager.session_of('qq')
+    check('E11 成功后会话状态为 success',
+          s10.status == manager.STATUS_SUCCESS, f'{s10.status} / {s10.message}')
+    check('E11 账号写进了会话（_set 必须收 account）',
+          s10.account == '测试账号', s10.account)
+    check('E11 会话不再是 running，不会卡死', not s10.running, s10.status)
+    check('E12 登录后重建引擎的回调被调用', bool(rebuilt), rebuilt)
+    check('E12 发出了登录成功通知',
+          any('Cookie 已更新' in t for t in sent), [t[:36] for t in sent])
+
+    # E13：收尾阶段（发通知）抛异常，也不能把会话卡在 running
+    def boom(text, user, **kw):
+        raise RuntimeError('发送通知炸了')
+
+    manager.send_text = boom
+    sent.clear()
+    rebuilt.clear()
+    ok13, _ = manager.start_login('qq', 'tester', on_success=lambda: rebuilt.append(1))
+    check('E13 通知发送失败时仍能发起登录', ok13 is True)
+    wait_finished('qq')
+    s13 = manager.session_of('qq')
+    check('E13 通知失败不影响会话终态',
+          s13.status == manager.STATUS_SUCCESS, s13.status)
+    check('E13 会话没卡在 running', not s13.running, s13.status)
+    check('E13 引擎重建照常执行', bool(rebuilt), rebuilt)
+
+    manager._login_qq = orig_login_qq
+    manager.send_text = orig_send_text
+
 
 def part_updater() -> None:
     print()
@@ -355,9 +413,29 @@ def part_updater() -> None:
     ok, detail = updater.dry_run('99.99.99')
     check('F9 预检会拦下装不上的版本', ok is False, detail.replace('\n', ' ')[:70])
 
-    # 回滚记录
+    # --- 回滚 / 自愈：这一段必须**完全隔离，绝不真的装包** ----------------------
+    # rollback() / startup_guard() 会照 update_state.json 里的 previous 真跑
+    # `pip install`（非 dry-run）。曾经因为 data/ 里残留了一条 previous=2.9.0 的旧记录，
+    # 这段测试把宿主 conda 环境里的 musicdl 从 **2.13.11 降到了 2.9.0**。
+    # 所以这里上两道保险：(1) 先清掉遗留状态；(2) 把 _run_pip 打桩。
+    orig_run_pip = updater._run_pip
+    pip_calls: list[list[str]] = []
+
+    def fake_pip(cmd):
+        pip_calls.append(list(cmd))
+        return True, '（打桩，未真的装包）'
+
+    updater._run_pip = fake_pip
+    for _p in (updater._state_path(), updater._pending_marker()):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
+
     ok, detail = updater.rollback()
     check('F10 没有记录时回滚给出明确提示', ok is False and '没有可回滚' in detail, detail)
+    check('F10 没有记录时不会真的执行 pip（隔离）', not pip_calls, pip_calls)
+
     updater.mark_pending('9.9.9', '99.0.0')
     check('F11 更新标记已置位', updater.pending_exists() is True)
     check('F12 记录里的旧版本可读', updater.previous_version() == '9.9.9',
@@ -371,6 +449,9 @@ def part_updater() -> None:
     note = updater.startup_guard()
     check('F15 上次更新失败会自愈（无记录时明确提示）',
           '上次更新' in note and not updater.pending_exists(), note[:50])
+    check('F15 自愈过程中没有真的装包（隔离）', not pip_calls, pip_calls)
+
+    updater._run_pip = orig_run_pip
 
 
 def part_restart() -> None:

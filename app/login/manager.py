@@ -99,7 +99,8 @@ def start_login(source: str, notify_user: str, on_success: Optional[Callable[[],
 
 
 def _set(session: LoginSession, *, status: Optional[str] = None,
-         message: Optional[str] = None, png: Optional[bytes] = None) -> None:
+         message: Optional[str] = None, png: Optional[bytes] = None,
+         account: Optional[str] = None) -> None:
     with _lock:
         if status is not None:
             session.status = status
@@ -107,36 +108,71 @@ def _set(session: LoginSession, *, status: Optional[str] = None,
             session.message = message
         if png is not None:
             session.png = png
+        if account is not None:
+            session.account = account
+
+
+def _notify(text: str, user: str) -> None:
+    """给发起人发一条登录通知，发送失败只记日志。
+
+    这里刻意不用裸 `send_text`：登录线程一旦因为发消息失败而崩掉，会话就会永远
+    停在 `running` 态 —— 用户既收不到通知，又再也发不起登录（两条合起来是个死局）。
+    """
+    if not text:
+        return
+    try:
+        send_text(text, user)
+    except Exception as e:
+        logger.warning('发送登录通知失败：%s', e)
 
 
 def _run_login(session: LoginSession, on_success: Optional[Callable[[], None]]) -> None:
+    """后台登录线程的主体。
+
+    **必须保证这个函数无论出什么事，会话都会落到终态**（success / failed）。
+    它跑在守护线程里，异常不会有人接 —— 一旦漏出去，会话就永远停在
+    `running`（waiting/scanned），用户再也发不起登录。所以这里有两层 try：
+    内层处理「登录本身」的异常，外层兜住「收尾动作」的异常。
+    """
     meta = SOURCE_META[session.source]
     name = meta['name']
     user = session.notify_user
     try:
-        if session.source == 'qq':
-            ok, message, account, expires_in = _login_qq(session, user)
-        else:
-            ok, message, account, expires_in = _login_netease(session, user)
-    except Exception as e:
-        logger.error('%s 登录异常：%s', name, e, exc_info=True)
-        ok, message, account, expires_in = False, f'未预期的错误：{e}', '', 0
-
-    session.finished_at = time.time()
-    if not ok:
-        _set(session, status=STATUS_FAILED, message=message)
-        if message:
-            send_text(message, user)
-        return
-
-    _set(session, status=STATUS_SUCCESS, message='登录成功', account=account)
-    cookie_store.reset_alert(session.source)
-    if on_success:
         try:
-            on_success()          # 回调：重建引擎
+            if session.source == 'qq':
+                ok, message, account, expires_in = _login_qq(session, user)
+            else:
+                ok, message, account, expires_in = _login_netease(session, user)
         except Exception as e:
-            logger.error('登录后重建引擎失败：%s', e, exc_info=True)
-    send_text(notices.login_success_text(name, account), user)
+            logger.error('%s 登录异常：%s', name, e, exc_info=True)
+            ok, message, account, expires_in = False, f'未预期的错误：{e}', '', 0
+
+        if not ok:
+            _set(session, status=STATUS_FAILED, message=message)
+            _notify(message, user)
+            return
+
+        # 走到这里 Cookie 已经落盘，登录这个事实不会再变。后面的收尾（清告警、重建
+        # 引擎、发通知）逐个包好，任何一步失败都不该推翻「登录成功」、更不能让线程崩掉。
+        _set(session, status=STATUS_SUCCESS, message='登录成功', account=account)
+        try:
+            cookie_store.reset_alert(session.source)
+        except Exception as e:
+            logger.warning('清除 %s 的 Cookie 告警标记失败：%s', name, e)
+        if on_success:
+            try:
+                on_success()          # 回调：重建引擎
+            except Exception as e:
+                logger.error('登录后重建引擎失败：%s', e, exc_info=True)
+        _notify(notices.login_success_text(name, account), user)
+    except Exception as e:
+        logger.error('%s 登录流程异常终止：%s', name, e, exc_info=True)
+        # 已经判成功就别再改回失败（收尾里的异常都在上面各自兜住了，走到这里
+        # 基本只可能是成功之前出的问题）。
+        if session.status != STATUS_SUCCESS:
+            _set(session, status=STATUS_FAILED, message=f'登录流程异常终止：{e}')
+    finally:
+        session.finished_at = time.time()
 
 
 # --- QQ ---------------------------------------------------------------------
