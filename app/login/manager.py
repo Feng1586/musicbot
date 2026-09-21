@@ -2,14 +2,17 @@
 
 设计要点
 * **只有用户主动发 `/qq login`、`/wyy login` 才会执行**（不自动重登）。
-* 二维码**以图片消息发送**（企微原生支持 `msgtype=image`）。
-  图片发不出去时不影响流程：文本里已经带了 `{域名}/login/{源}` 链接。
+* 二维码优先**以图片消息发送**（企微原生支持 `msgtype=image`）。
+  图片这条路未必通（反代可能没放行 `media/upload`），所以**先上传探路再决定
+  文案**，见 `_announce_qrcode`；发不出去时按「对外链接 → 局域网地址 →
+  请联系管理员」三级降级，绝不留下一条「下一条消息是二维码」的空头承诺。
 * 同一源同时只允许一个登录流程，重复发起会被拒绝。
 * 登录成功后：Cookie 落盘 → **重建引擎**（否则新 Cookie 不会生效）→ 清除失效标记 → 回消息。
 """
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,7 +22,7 @@ from app import cookies as cookie_store
 from app import notices
 from app.config import settings
 from app.sources import SOURCE_META
-from app.wecom import send_image, send_text
+from app.wecom import send_image_message, send_text, upload_media
 from utils.logger import logger
 
 # 单张二维码最长等待时间（分钟）
@@ -243,16 +246,117 @@ def _login_netease(session: LoginSession, user: str) -> tuple[bool, str, str, in
 
 # --- 通知 -------------------------------------------------------------------
 
+# 这些地址要么是保留段、要么是虚拟网卡（TUN），都不是「别人能连进来」的地址。
+#   198.18.0.0/15  RFC 2544 保留段，Clash 之类的 TUN 网卡常用（本机实测踩过）
+#   169.254.0.0/16 link-local
+#   100.64.0.0/10  CGNAT
+_UNREACHABLE_PREFIXES = ('198.18.', '198.19.', '169.254.', '100.64.')
+
+
+def _is_usable_lan_ip(ip: str) -> bool:
+    """这个地址是不是「同一局域网内的人能连上」的 RFC1918 私有地址。"""
+    if not ip or ip.startswith(('127.', '0.', '255.')):
+        return False
+    if ip.startswith(_UNREACHABLE_PREFIXES):
+        return False
+    try:
+        first, second = (int(x) for x in ip.split('.')[:2])
+    except ValueError:
+        return False
+    return (first == 10
+            or (first == 172 and 16 <= second <= 31)
+            or (first == 192 and second == 168))
+
+
+def _lan_url(source: str) -> str:
+    """兜底用的局域网扫码地址。
+
+    什么时候会用到：图片发不出去（反代没放行 `media/upload`，或图片功能被关掉），
+    同时又没配 `MUSICBOT_PUBLIC_BASE_URL`。这时给一个内网地址，扫码的人只要
+    和服务器在同一局域网就能用 —— 比让用户干等一条不会来的图片消息强得多。
+
+    ⚠️ 这里必须**先把虚拟网卡排掉**：本机开着代理时，最简单的
+    「UDP connect 看默认路由」会返回 TUN 网卡地址（本机实测拿到 `198.18.0.0`），
+    那是 RFC 2544 保留段，别人根本连不上。旧后端当初也踩过同一个坑。
+    所以这里改成枚举本机地址 + 只认 RFC1918 私有网段，并优先常见的 192.168.x.x。
+    """
+    candidates: list[str] = []
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if _is_usable_lan_ip(ip) and ip not in candidates:
+                candidates.append(ip)
+    except OSError as e:
+        logger.debug('枚举本机地址失败：%s', e)
+
+    if not candidates:
+        # 兜底：让系统选一次路。这条可能落在 TUN 网卡上，所以要再过一遍过滤
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect(('223.5.5.5', 80))
+                ip = sock.getsockname()[0]
+            finally:
+                sock.close()
+            if _is_usable_lan_ip(ip):
+                candidates.append(ip)
+        except OSError as e:
+            logger.debug('探测默认路由地址失败：%s', e)
+
+    if not candidates:
+        return ''
+    # 本机实测会同时枚举出物理网卡与几张虚拟网卡的地址：
+    #   192.168.2.6（真实网卡）  192.168.149.1 / 192.168.92.1（VMware）
+    #   172.21.208.1（WSL）      198.18.0.0（TUN，已被过滤掉）
+    # 虚拟网卡的地址几乎都是网段里的 .1，所以把 .1 结尾的往后排；
+    # 再按「192.168 → 10 → 其它私有段」的顺序偏好家用/办公最常见的网段。
+    def _rank(ip: str) -> tuple:
+        first = int(ip.split('.')[0])
+        tier = 0 if ip.startswith('192.168.') else (1 if first == 10 else 2)
+        return (ip.endswith('.1'), tier, ip)
+
+    candidates.sort(key=_rank)
+    return f'http://{candidates[0]}:{settings.port}/login/{source}'
+
+
 def _announce_qrcode(session: LoginSession, user: str, source: str) -> None:
-    """先把链接/说明用文本发出去，再发二维码图片。"""
+    """把登录说明与二维码发给发起登录的人。
+
+    顺序上有个坑：第一条说明里会写「二维码图片见下一条消息」。如果图片其实
+    发不出去（图片功能被关掉，或反代没放行 `media/upload`），这句话就成了
+    空头支票 —— 用户会一直等一条永远不会来的消息。
+
+    所以这里**先把素材传上去探一次路**：上传是纯 API 调用、不产生任何用户
+    可见的消息，等确定了图片发得出去，才发那条带承诺的说明。素材上传得到的
+    media_id 直接接着用来发消息，所以总共还是一次上传 + 一次发送，没有多花。
+    """
     meta = SOURCE_META[source]
     page_url = ''
     if settings.public_base_url:
         page_url = f'{settings.public_base_url}/login/{source}'
-    send_text(notices.login_start_text(meta['name'], page_url), user)
 
     png = qrcode_png(source)
     if not png:
         return
-    if not send_image(png, user) and page_url:
-        send_text(f'二维码图片发送失败，请打开这个链接扫码：{page_url}', user)
+
+    media_id, upload_error = '', ''
+    if settings.image_enabled:
+        try:
+            media_id = upload_media(png)
+        except Exception as e:
+            upload_error = str(e)
+            logger.warning('二维码素材上传失败（%s）：%s', source, upload_error)
+
+    send_text(notices.login_start_text(meta['name'], page_url,
+                                       image_expected=bool(media_id)), user)
+
+    if media_id:
+        send_image_message(media_id, user)
+    elif upload_error:
+        # 本来该有图片，结果没发出来 —— 必须说一声，否则用户会一直等
+        send_text(notices.qrcode_undeliverable_text(
+            source, page_url=page_url, lan_url=_lan_url(source),
+            reason=upload_error), user)
+    elif not page_url:
+        # 图片功能被配置主动关掉了，而且没有对外地址
+        send_text(notices.qrcode_undeliverable_text(
+            source, lan_url=_lan_url(source)), user)

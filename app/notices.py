@@ -173,14 +173,41 @@ BLIND_NO_RESULT = '❌ 没有搜到「{keyword}」，换个歌名或换源（/qq
 BLIND_QUEUED = '🎧 已加入下载队列：{count}（盲选：{title}）'
 
 
-def login_start_text(source_name: str, page_url: str = '') -> str:
+def login_start_text(source_name: str, page_url: str = '', *,
+                     image_expected: bool = True) -> str:
+    """扫码登录的第一条说明。
+
+    `image_expected=False` 表示这次不会再跟一条二维码图片（素材上传走不通）。
+    此时**必须**去掉「二维码图片见下一条消息」—— 否则就是一句空头支票，
+    用户会一直等一条永远不会来的消息。这正是旧写法在「反代没放行
+    media/upload、又没配对外地址」这个组合下的表现。
+    """
     lines = [
         f'🔐 正在为「{source_name}」生成登录二维码…',
         '请用手机 App 扫码，并在手机上确认登录',
     ]
     if page_url:
         lines.append(f'也可以打开：{page_url}')
-    lines.append('（二维码图片见下一条消息）')
+    if image_expected:
+        lines.append('（二维码图片见下一条消息）')
+    return '\n'.join(lines)
+
+
+def qrcode_undeliverable_text(source: str, *, page_url: str = '', lan_url: str = '',
+                              reason: str = '') -> str:
+    """二维码一条路都走不通时的说明。
+
+    三种情况从好到差：有对外地址 → 给链接；只有局域网 → 给内网地址；
+    什么都没有 → 明确告诉管理员该改哪里。
+    """
+    lines = ['⚠️ 二维码图片没能发出来' + (f'（{_clip(reason, 80)}）' if reason else '')]
+    if page_url:
+        lines.append(f'请打开这个链接扫码：{page_url}')
+    elif lan_url:
+        lines.append(f'请在同一局域网内打开这个链接扫码：{lan_url}')
+    else:
+        lines.append('请联系管理员：让反代放行 /cgi-bin/media/upload，'
+                     '或配置 MUSICBOT_PUBLIC_BASE_URL 后重试')
     return '\n'.join(lines)
 
 

@@ -153,13 +153,16 @@ def upload_media(data: bytes, *, media_type: str = 'image',
     return media_id
 
 
-def send_image(data: bytes, touser: str, *, raise_on_error: bool = False) -> bool:
-    """发图片消息（失败时调用方应降级为「文本 + 链接」）。"""
-    if not settings.image_enabled:
-        logger.info('图片消息已被配置关闭，跳过')
-        return False
+def send_image_message(media_id: str, touser: str, *,
+                       raise_on_error: bool = False) -> bool:
+    """用已经拿到的 media_id 发图片消息。
+
+    单独拆出来是为了让调用方能**先上传探路、再决定文案**：
+    上传是纯 API 调用、不产生任何用户可见的消息，而 `msgtype=image` 一旦发出
+    就收不回来了。扫码登录那里正是靠这个顺序，才避免了先承诺「下一条是二维码」
+    结果发不出去的情况。
+    """
     try:
-        media_id = upload_media(data)
         _post_message({
             'touser': touser,
             'msgtype': 'image',
@@ -174,6 +177,21 @@ def send_image(data: bytes, touser: str, *, raise_on_error: bool = False) -> boo
         if raise_on_error:
             raise
         return False
+
+
+def send_image(data: bytes, touser: str, *, raise_on_error: bool = False) -> bool:
+    """上传并发送一张图片（失败时调用方应降级为「文本 + 链接」）。"""
+    if not settings.image_enabled:
+        logger.info('图片消息已被配置关闭，跳过')
+        return False
+    try:
+        media_id = upload_media(data)
+    except Exception as e:
+        logger.error('上传图片失败（touser=%s）：%s', touser, e)
+        if raise_on_error:
+            raise
+        return False
+    return send_image_message(media_id, touser, raise_on_error=raise_on_error)
 
 
 def probe_credentials() -> tuple[bool, str]:
