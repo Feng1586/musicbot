@@ -147,10 +147,13 @@ def part_probe() -> None:
     check('B2 QQ 显示了剩余有效期', '未知' not in qq.expiry_text() or qq.key_expires_in == 0,
           qq.expiry_text())
 
-    wyy = cs.probe('wyy')
-    check('B3 网易云（未登录）判定为未登录', wyy.ok is False, wyy.reason)
+    # ⚠️ B3/B4 测的是「本地没有凭据」这条分支，所以**必须显式传空 Cookie**，
+    # 不能依赖"当前真的没登录" —— 用户一旦登录成功，靠真实状态判断的写法必然报红
+    # （2026-09-22 实际踩到：登录成功后这里报 FAIL，看着像代码坏了）。
+    wyy = cs.probe('wyy', {})
+    check('B3 网易云（本地无 Cookie）判定为未登录', wyy.ok is False, wyy.reason)
 
-    line = cs.status_line('wyy', '网易云音乐', 'wyy', wyy, cs.load('wyy'))
+    line = cs.status_line('wyy', '网易云音乐', 'wyy', wyy, cs.CookieRecord(source='wyy'))
     check('B4 未登录的状态行提示去登录', 'login' in line, line.replace('\n', ' '))
 
 
@@ -179,9 +182,14 @@ def part_qrcode() -> None:
         check('C3 网易云 unikey 获取成功', bool(unikey), unikey[:12] + '…')
         png = netease.qrcode_png(unikey)
         check('C4 网易云二维码渲染成 PNG', png[:4] == b'\x89PNG', f'{len(png)} 字节')
-        check('C5 二维码内容是正确的登录链接',
-              netease.login_url(unikey).startswith('https://music.163.com/login?codekey='),
-              netease.login_url(unikey))
+        # 2026-09-22：二维码内容换成网页端在用的「确认登录页」入口。
+        # 老的 `/login?codekey=` 会让未登录的浏览器在 OAuth 跳转时丢掉 codekey，
+        # 「确认」永远不发生（用户实测：登录完直接落到首页-推荐音乐）。
+        url = netease.login_url(unikey)
+        check('C5 二维码内容是确认登录页（不再是老的 /login?codekey=）',
+              url.startswith('https://music.163.com/st/platform/scanlogin?codekey=')
+              and 'hdw_device=web' in url and unikey in url,
+              url)
         result = netease.poll(http, unikey)
         check('C6 未扫码时状态为 waiting',
               result.status == netease.STATUS_WAITING, f'{result.status} / {result.message}')

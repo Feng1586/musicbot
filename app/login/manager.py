@@ -25,10 +25,8 @@ from app.sources import SOURCE_META
 from app.wecom import send_image_message, send_text, upload_media
 from utils.logger import logger
 
-# 单张二维码最长等待时间（分钟）
+# 单张二维码最长等待时间（分钟）。超时**只提示**，不自动换码 —— 由用户重新发指令。
 QRCODE_TIMEOUT_MINUTES = 5
-# 一张二维码过期后最多自动换几张
-MAX_QRCODE_REFRESH = 3
 # 轮询间隔（秒）
 POLL_INTERVAL_SECONDS = 2.0
 
@@ -98,9 +96,20 @@ def start_login(source: str, notify_user: str, on_success: Optional[Callable[[],
     return True, 'started'
 
 
+# 状态 → 中文，仅用于日志
+_STATUS_TEXT = {
+    STATUS_IDLE: '未开始',
+    STATUS_WAITING: '等待扫码',
+    STATUS_SCANNED: '已扫码待确认',
+    STATUS_SUCCESS: '登录成功',
+    STATUS_FAILED: '登录失败',
+}
+
+
 def _set(session: LoginSession, *, status: Optional[str] = None,
          message: Optional[str] = None, png: Optional[bytes] = None,
          account: Optional[str] = None) -> None:
+    prev = session.status
     with _lock:
         if status is not None:
             session.status = status
@@ -110,6 +119,13 @@ def _set(session: LoginSession, *, status: Optional[str] = None,
             session.png = png
         if account is not None:
             session.account = account
+    # 状态跃迁单独记一条日志。以前这里一声不响，所以用户说"扫码没反应"时，
+    # 日志里完全看不出进展（2026-09-22 排查网易云登录时被这条坑了很久）。
+    # 纯观测，不改任何行为；同状态重复设置（例如每张新码都设 waiting）不会重复打。
+    if status is not None and status != prev:
+        logger.info('%s 登录状态：%s → %s（%s）', session.source,
+                    _STATUS_TEXT.get(prev, prev), _STATUS_TEXT.get(status, status),
+                    message or '')
 
 
 def _notify(text: str, user: str) -> None:
@@ -186,48 +202,41 @@ def _login_qq(session: LoginSession, user: str
     from app.login.qq_login import QQLoginError
 
     deadline = time.time() + QRCODE_TIMEOUT_MINUTES * 60
-    refreshed = 0
     nickname = ''
 
-    while True:
-        try:
-            qr = qq_login.request_qrcode()
-        except QQLoginError as e:
-            return False, notices.LOGIN_FAILED.format(source='qq', reason=e), '', 0
+    try:
+        qr = qq_login.request_qrcode()
+    except QQLoginError as e:
+        return False, notices.LOGIN_FAILED.format(source='qq', reason=e), '', 0
 
-        _set(session, png=qr.png, status=STATUS_WAITING, message='等待扫码')
-        _announce_qrcode(session, user, 'qq')
+    _set(session, png=qr.png, status=STATUS_WAITING, message='等待扫码')
+    _announce_qrcode(session, user, 'qq')
 
-        expired = False
-        while time.time() < deadline:
-            poll = qq_login.poll_qrcode(qr)
-            nickname = poll.nickname or nickname
-            if poll.status == STATUS_WAITING:
-                pass
-            elif poll.status == STATUS_SCANNED:
-                _set(session, status=STATUS_SCANNED, message='已扫码，请在手机上确认')
-            elif poll.status == STATUS_CONFIRMED:
-                credential = qq_login.complete_login(qr, poll.uin, poll.sigx)
-                account = credential.get('nickname') or nickname or str(credential.get('musicid') or '')
-                cookies = qq_login.build_cookies(credential, time.time())
-                cookie_store.save('qq', cookies, account=account,
-                                  key_expires_in=int(credential.get('key_expires_in') or 0))
-                return True, '', account, int(credential.get('key_expires_in') or 0)
-            elif poll.status == STATUS_REFUSED:
-                return (False, notices.LOGIN_FAILED.format(
-                    source='qq', reason='二维码被取消或拒绝授权'), '', 0)
-            elif poll.status == STATUS_EXPIRED:
-                expired = True
-                break
-            time.sleep(POLL_INTERVAL_SECONDS)
+    while time.time() < deadline:
+        poll = qq_login.poll_qrcode(qr)
+        nickname = poll.nickname or nickname
+        if poll.status == STATUS_WAITING:
+            pass
+        elif poll.status == STATUS_SCANNED:
+            _set(session, status=STATUS_SCANNED, message='已扫码，请在手机上确认')
+        elif poll.status == STATUS_CONFIRMED:
+            credential = qq_login.complete_login(qr, poll.uin, poll.sigx)
+            account = credential.get('nickname') or nickname or str(credential.get('musicid') or '')
+            cookies = qq_login.build_cookies(credential, time.time())
+            cookie_store.save('qq', cookies, account=account,
+                              key_expires_in=int(credential.get('key_expires_in') or 0))
+            return True, '', account, int(credential.get('key_expires_in') or 0)
+        elif poll.status == STATUS_REFUSED:
+            return (False, notices.LOGIN_FAILED.format(
+                source='qq', reason='二维码被取消或拒绝授权'), '', 0)
+        elif poll.status == STATUS_EXPIRED:
+            logger.info('QQ 二维码已被服务端判为过期')
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
 
-        if expired and refreshed < MAX_QRCODE_REFRESH:
-            refreshed += 1
-            logger.info('QQ 二维码过期，自动换一张（第 %d 次）', refreshed)
-            continue
-        if expired:
-            return False, notices.LOGIN_TIMEOUT.format(source='qq'), '', 0
-        return False, notices.LOGIN_TIMEOUT.format(source='qq'), '', 0
+    # 超时（或二维码过期）→ **只提示超时，由用户重新发指令**。
+    # 以前这里会自动换码最多 3 张，已按要求删除（2026-09-22）。
+    return False, notices.LOGIN_TIMEOUT.format(source='qq'), '', 0
 
 
 # --- 网易云 ------------------------------------------------------------------
@@ -239,45 +248,107 @@ def _login_netease(session: LoginSession, user: str) -> tuple[bool, str, str, in
                                    STATUS_WAITING, NeteaseLoginError)
 
     deadline = time.time() + QRCODE_TIMEOUT_MINUTES * 60
-    refreshed = 0
 
-    while True:
+    try:
+        unikey, http = netease.request_unikey()
+        png = netease.qrcode_png(unikey)
+    except (NeteaseLoginError, Exception) as e:
+        return False, notices.LOGIN_FAILED.format(source='wyy', reason=e), '', 0
+
+    logger.info('网易云二维码已发出，等待扫码…')
+    _set(session, png=png, status=STATUS_WAITING, message='等待扫码')
+    _announce_qrcode(session, user, 'wyy')
+
+    unknown_logged = False
+    while time.time() < deadline:
+        result = netease.poll(http, unikey)
+        if result.status == STATUS_WAITING:
+            unknown_logged = False
+        elif result.status == STATUS_SCANNED:
+            unknown_logged = False
+            _set(session, status=STATUS_SCANNED, message='已扫码，请在手机上确认')
+        elif result.status == STATUS_CONFIRMED:
+            ck = result.cookies
+            account = netease.account_of(ck) or ''
+            cookie_store.save('wyy', ck, account=account)
+            return True, '', account, 0
+        elif result.status == STATUS_RISK:
+            return (False, notices.LOGIN_FAILED.format(
+                source='wyy', reason='触发风控，请稍后再试'), '', 0)
+        elif result.status == STATUS_EXPIRED:
+            logger.info('网易云二维码已被服务端判为过期')
+            break
+        elif result.status == netease.STATUS_UNKNOWN:
+            # 以前这里是静默 pass：网易云若回了预期外的 code，线索会被全部吞掉，
+            # 外面看起来就是"扫了没反应"。每次都提醒，但同一张码只提醒一次。
+            if not unknown_logged:
+                logger.warning('网易云轮询返回未知状态（code=%r）：%s',
+                               result.code, result.message)
+                unknown_logged = True
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    # 超时（或二维码过期）→ **只提示超时，由用户重新发指令**。
+    # 以前这里会自动换码最多 3 张，已按要求删除（2026-09-22）。
+    return False, notices.LOGIN_TIMEOUT.format(source='wyy'), '', 0
+
+
+# --- 网易云：手机号 + 短信验证码登录 ------------------------------------------
+#
+# 这条流程**不用 LoginSession**（没有二维码、不需要轮询），所以只有两个短动作：
+#   1) `/wyy login sms <手机号>`  → 发验证码，并把「该用户正在等验证码」记在内存里
+#   2) `/wyy login code <验证码>` → 用验证码换 Cookie
+# 记的是**内存字典**：进程一重启就失效，用户重发一次 sms 即可（无需持久化，
+# 免得把手机号落盘）。
+
+_sms_pending: dict[str, str] = {}
+
+
+def start_sms_login(cellphone: str, user: str) -> tuple[bool, str]:
+    """短信登录第一步：发送验证码。返回 (是否成功, 手机号 或 失败原因)。"""
+    from app.login import netease
+
+    phone = (cellphone or '').strip()
+    if not (len(phone) == 11 and phone.isdigit() and phone.startswith('1')):
+        return False, f'手机号格式不对：{phone or "(空)"}（应为 11 位数字，例如 13800138000）'
+    try:
+        netease.send_sms_captcha(phone)
+    except Exception as e:
+        logger.error('发送网易云验证码失败：%s', e)
+        return False, str(e)
+    _sms_pending[user] = phone
+    return True, phone
+
+
+def finish_sms_login(user: str, captcha: str,
+                     on_success: Optional[Callable[[], None]] = None
+                     ) -> tuple[bool, str, str]:
+    """短信登录第二步：用验证码换 Cookie。返回 (是否成功, 账号, 失败原因)。"""
+    from app.login import netease
+
+    phone = _sms_pending.get(user, '')
+    if not phone:
+        return False, '', '还没有待验证的手机号，请先发送 /wyy login sms <手机号>'
+    code = (captcha or '').strip()
+    if not (code.isdigit() and 4 <= len(code) <= 6):
+        return False, '', f'验证码应为 4-6 位数字：{code or "(空)"}'
+    try:
+        cookies, account = netease.login_by_cellphone(phone, code)
+    except Exception as e:
+        logger.error('网易云验证码登录失败：%s', e)
+        return False, '', str(e)
+
+    cookie_store.save('wyy', cookies, account=account)
+    _sms_pending.pop(user, None)
+    try:
+        cookie_store.reset_alert('wyy')
+    except Exception as e:
+        logger.warning('清除 wyy 的 Cookie 告警标记失败：%s', e)
+    if on_success:
         try:
-            unikey, http = netease.request_unikey()
-            png = netease.qrcode_png(unikey)
-        except (NeteaseLoginError, Exception) as e:
-            return False, notices.LOGIN_FAILED.format(source='wyy', reason=e), '', 0
-
-        _set(session, png=png, status=STATUS_WAITING, message='等待扫码')
-        _announce_qrcode(session, user, 'wyy')
-
-        expired = False
-        while time.time() < deadline:
-            result = netease.poll(http, unikey)
-            if result.status == STATUS_WAITING:
-                pass
-            elif result.status == STATUS_SCANNED:
-                _set(session, status=STATUS_SCANNED, message='已扫码，请在手机上确认')
-            elif result.status == STATUS_CONFIRMED:
-                ck = result.cookies
-                account = netease.account_of(ck) or ''
-                cookie_store.save('wyy', ck, account=account)
-                return True, '', account, 0
-            elif result.status == STATUS_RISK:
-                return (False, notices.LOGIN_FAILED.format(
-                    source='wyy', reason='触发风控，请稍后再试'), '', 0)
-            elif result.status == STATUS_EXPIRED:
-                expired = True
-                break
-            elif result.status == netease.STATUS_UNKNOWN:
-                pass          # 网络抖动，继续等
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-        if expired and refreshed < MAX_QRCODE_REFRESH:
-            refreshed += 1
-            logger.info('网易云二维码过期，自动换一张（第 %d 次）', refreshed)
-            continue
-        return False, notices.LOGIN_TIMEOUT.format(source='wyy'), '', 0
+            on_success()          # 回调：重建引擎，让新 Cookie 生效
+        except Exception as e:
+            logger.error('验证码登录后重建引擎失败：%s', e, exc_info=True)
+    return True, account, ''
 
 
 # --- 通知 -------------------------------------------------------------------

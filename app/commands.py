@@ -146,10 +146,7 @@ def _handle_command(raw: str, user: str) -> None:
 def _handle_source_command(source: str, args: list[str], state: UserState, user: str) -> None:
     meta = SOURCE_META[source]
     if args and args[0].lower() in ('login', '登录'):
-        ok, message = login_manager.start_login(
-            source, user, on_success=lambda: engine().rebuild('登录成功后刷新 Cookie'))
-        if not ok:
-            send_text(message, user)
+        _handle_login(source, args[1:], user)
         return
 
     state.source = source
@@ -157,6 +154,60 @@ def _handle_source_command(source: str, args: list[str], state: UserState, user:
     if not cookie_store.cookies_of(source):
         hint = (f'（尚未登录，搜索结果与音质受限，可发送 /{meta["cmd"]} login 扫码登录）')
     send_text(notices.source_switched_text(meta['name'], hint), user)
+
+
+def _handle_login(source: str, extra: list[str], user: str) -> None:
+    """登录入口。默认扫码；网易云还支持手机验证码（两步）。
+
+        /wyy login                    扫码登录（默认）
+        /wyy login sms 13800138000    给该手机号发验证码
+        /wyy login code 123456        用验证码完成登录
+    """
+    meta = SOURCE_META[source]
+    cmd = meta['cmd']
+    mode = extra[0].lower() if extra else ''
+
+    def _rebuild() -> None:
+        engine().rebuild('登录成功后刷新 Cookie')
+
+    if not mode:
+        ok, message = login_manager.start_login(source, user, on_success=_rebuild)
+        if not ok:
+            send_text(message, user)
+        return
+
+    if source != 'wyy':
+        send_text(f'「{meta["name"]}」只支持扫码登录：直接发送 /{cmd} login 即可', user)
+        return
+
+    if mode in ('sms', '短信', 'phone', '手机'):
+        if len(extra) < 2:
+            send_text(f'用法：/{cmd} login sms <手机号>\n例如：/{cmd} login sms 13800138000', user)
+            return
+        ok, payload = login_manager.start_sms_login(extra[1], user)
+        if not ok:
+            send_text(f'❌ 发送验证码失败：{payload}', user)
+            return
+        send_text(notices.SMS_CODE_SENT.format(
+            phone=f'{payload[:3]}****{payload[-4:]}', source=cmd), user)
+        return
+
+    if mode in ('code', '验证码'):
+        if len(extra) < 2:
+            send_text(f'用法：/{cmd} login code <验证码>\n例如：/{cmd} login code 123456', user)
+            return
+        ok, account, detail = login_manager.finish_sms_login(
+            user, extra[1], on_success=_rebuild)
+        if not ok:
+            send_text(f'❌ 登录失败：{detail}', user)
+            return
+        send_text(notices.login_success_text(meta['name'], account), user)
+        return
+
+    send_text(f'未识别的登录方式「{mode}」。可用：\n'
+              f'/{cmd} login                扫码登录\n'
+              f'/{cmd} login sms <手机号>    手机验证码登录\n'
+              f'/{cmd} login code <验证码>   提交验证码', user)
 
 
 def _handle_limit(args: list[str], user: str) -> None:

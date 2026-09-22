@@ -46,8 +46,10 @@ HELP_TEXT = """📖 musicbot 使用帮助
 /blind off   关闭
 
 【Cookie】
-/qq login    扫码登录 / 更新 QQ音乐 Cookie
-/wyy login   扫码登录 / 更新 网易云音乐 Cookie
+/qq login     扫码登录 / 更新 QQ音乐 Cookie
+/wyy login    扫码登录 / 更新 网易云音乐 Cookie
+/wyy login sms <手机号>   网易云：给手机发验证码
+/wyy login code <验证码>  网易云：用验证码完成登录（上一步之后）
 
 【队列】
 /queue   查看下载队列
@@ -219,7 +221,11 @@ def login_success_text(source_name: str, account: str = '') -> str:
 
 
 LOGIN_FAILED = '❌ 登录失败：{reason}\n可重新发送 /{source} login 再试一次'
-LOGIN_TIMEOUT = '⏰ 二维码已过期，请重新发送 /{source} login'
+LOGIN_TIMEOUT = '⏰ 扫码超时，二维码已失效，请重新发送 /{source} login'
+# 手机验证码登录（网易云）：第一步发码成功后的提示
+SMS_CODE_SENT = ('📱 验证码已发送到 {phone}\n'
+                 '收到后请发送：/{source} login code <验证码>\n'
+                 '例如 /{source} login code 123456（验证码几分钟内有效）')
 
 
 COOKIE_OK = '✅ {name}　正常（账号：{account}）'
