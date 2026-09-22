@@ -1,14 +1,19 @@
-"""网易云音乐扫码登录。
+"""网易云音乐扫码登录 + 手机验证码登录。
 
-流程（与官方 H5 一致）：
+流程（扫码，与官方网页端一致）：
 1. `weapi/login/qrcode/unikey` 拿 unikey
-2. 二维码内容 = `https://music.163.com/login?codekey={unikey}`
+2. 二维码内容 = **网页端的确认登录页**（`SCANLOGIN_URL`，见下面那段注释）：
+   `https://music.163.com/st/platform/scanlogin?codekey={unikey}&hdw_device=web&hdw_appid=web&hitExp=1`
+   ⚠️ 不要改回 `https://music.163.com/login?codekey=` —— 那是过时入口，
+   未登录的浏览器打开它会在登录跳转时丢掉 codekey，「确认」永远不发生（实测踩过）。
 3. 轮询 `weapi/login/qrcode/client/login`：
    * 800 二维码过期
    * 801 等待扫码
    * 802 已扫码，等待手机确认
    * 803 成功（响应里带 MUSIC_U 等 Cookie）
    * 8821 触发风控，建议稍后再试
+
+手机验证码登录（`send_sms_captcha` + `login_by_cellphone`）见文件末尾。
 
 加密直接用 musicdl 自带的 `WeapiCryptoUtils`（它本来就是 musicdl 的依赖），
 省掉最容易写错的 AES+RSA 那一段。
