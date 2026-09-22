@@ -216,7 +216,7 @@ def main() -> int:
 
         queued = wait_for(
             lambda: next((c for c, _u in messages(TEST_USER, since=t_dl)
-                          if c.startswith('🎧')), None), 30)
+                          if c.startswith('🧾')), None), 30)
         check('收到入队回执', bool(queued), queued or '(无)')
 
         started_msg = wait_for(

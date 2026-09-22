@@ -18,10 +18,13 @@ from typing import Any, Optional
 from app import cookies as cookie_store
 from app import notices
 from app import updater
-from app.config import (SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, save_runtime_override,
-                        settings)
-from app.downloader import DownloadJob, build_target_path, get_queue
+from app.config import (SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, TASK_INTERVAL_MAX,
+                        TASK_INTERVAL_MIN, TASK_TIMEOUT_MAX, TASK_TIMEOUT_MIN,
+                        save_runtime_override, settings)
+from app.downloader import build_target_path, download_and_report
 from app.login import manager as login_manager
+from app.pipeline import (KIND_BLIND, KIND_DOWNLOAD, KIND_SEARCH, Task,
+                          get_queue)
 from app.runtime import restart
 from app.sources import SOURCE_META, SOURCE_ORDER, engine
 from app.wecom import send_text
@@ -37,6 +40,9 @@ class UserState:
     blind: bool = False
     items: list = field(default_factory=list)
     keyword: str = ''
+    # 这批结果是用哪个源搜出来的。**必须单独记**：用户搜完可以立刻切源，
+    # 若用 state.source 去拼下载路径，歌会落到另一个源的目录里。
+    items_source: str = ''
     at: float = 0.0
 
     def results_fresh(self) -> bool:
@@ -128,6 +134,10 @@ def _handle_command(raw: str, user: str) -> None:
         send_text(notices.SOURCE_CURRENT.format(name=source_name(state.source)), user)
     elif command in ('limit', '条数'):
         _handle_limit(args, user)
+    elif command in ('interval', '间隔'):
+        _handle_interval(args, user)
+    elif command in ('timeout', '超时'):
+        _handle_timeout(args, user)
     elif command in ('blind', '盲下载'):
         _handle_blind(args, state, user)
     elif command in ('queue', '队列'):
@@ -232,6 +242,48 @@ def _handle_limit(args: list[str], user: str) -> None:
     send_text(f'✅ 搜索条数已设为 {value}（对所有源生效，立即生效）', user)
 
 
+def _handle_interval(args: list[str], user: str) -> None:
+    """任务之间的间隔（秒）。串行 + 间隔能降低被平台风控的概率。"""
+    if not args:
+        send_text(notices.task_interval_status(
+            settings.task_interval_seconds, TASK_INTERVAL_MIN, TASK_INTERVAL_MAX), user)
+        return
+    try:
+        value = int(args[0])
+    except ValueError:
+        send_text(f'请给一个 {TASK_INTERVAL_MIN}-{TASK_INTERVAL_MAX} 之间的数字，'
+                  f'例如 /interval 5', user)
+        return
+    if value < TASK_INTERVAL_MIN or value > TASK_INTERVAL_MAX:
+        send_text(f'❌ 超出范围：只能是 {TASK_INTERVAL_MIN}-{TASK_INTERVAL_MAX} 秒之间的整数'
+                  f'（0 = 任务之间不等待）', user)
+        return
+    settings.task_interval_seconds = value
+    save_runtime_override('task_interval_seconds', value)
+    send_text(notices.TASK_INTERVAL_SET.format(value=value), user)
+
+
+def _handle_timeout(args: list[str], user: str) -> None:
+    """单任务超时（分钟）。超时后放弃等待、继续处理后面的任务。"""
+    if not args:
+        send_text(notices.task_timeout_status(
+            settings.task_timeout_minutes, TASK_TIMEOUT_MIN, TASK_TIMEOUT_MAX), user)
+        return
+    try:
+        value = int(args[0])
+    except ValueError:
+        send_text(f'请给一个 {TASK_TIMEOUT_MIN}-{TASK_TIMEOUT_MAX} 之间的数字，'
+                  f'例如 /timeout 5', user)
+        return
+    if value < TASK_TIMEOUT_MIN or value > TASK_TIMEOUT_MAX:
+        send_text(f'❌ 超出范围：只能是 {TASK_TIMEOUT_MIN}-{TASK_TIMEOUT_MAX} 分钟之间的整数',
+                  user)
+        return
+    settings.task_timeout_minutes = value
+    save_runtime_override('task_timeout_minutes', value)
+    send_text(notices.TASK_TIMEOUT_SET.format(value=value), user)
+
+
 def _handle_blind(args: list[str], state: UserState, user: str) -> None:
     if not args:
         send_text(notices.BLIND_MODE_STATUS.format(
@@ -296,38 +348,29 @@ def _handle_restart(user: str) -> None:
     restart()
 
 
-# --- 搜索 / 下载 ------------------------------------------------------------
+# --- 搜索 / 下载：入口只做「回执 + 入队」-------------------------------------
+# 真正的搜索与下载在下面 execute_task 里，由 app/pipeline.py 的 worker 串行调用。
 
 def _handle_text(content: str, user: str) -> None:
-    """非指令文本：盲模式 → 直接下第一首；否则正常搜索。"""
+    """非指令文本：盲下 → 搜到第 1 首直接下；否则只搜、回编号列表。
+
+    ⚠️ 这里**不做搜索**。搜索以前跑在回调线程里、和下载抢同一把引擎锁，
+    用户连发多首歌名时「等锁 + 搜索」整段时间一条反馈都发不出去，看着就像卡死。
+    现在只做两件事：发回执、入队。
+    """
     state = user_state(user)
-    outcome = engine().search(state.source, content)
-    if not outcome.ok:
-        send_text(notices.SEARCH_FAILED, user)
-        logger.warning('搜索失败：%s', outcome.error)
-        return
-    if not outcome.items:
-        send_text(notices.SEARCH_EMPTY, user)
-        return
-
-    state.items = outcome.items
-    state.keyword = content
-    state.at = time.time()
-
-    if state.blind:
-        target = outcome.items[0]
-        _enqueue([target], state, user, blind=True)
-        return
-
-    lines = [f'{idx}. {_title_of(song)}' for idx, song in enumerate(outcome.items, 1)]
-    send_text(notices.search_result_text(
-        source_name(state.source), lines, limit_hint=notices.SEARCH_HINT), user)
+    kind = KIND_BLIND if state.blind else KIND_SEARCH
+    _submit([Task(kind=kind, user=user, title=content,
+                  source=state.source, keyword=content)], user)
 
 
 def _handle_indices(content: str, user: str) -> None:
     state = user_state(user)
     if not state.items:
-        send_text(notices.NO_SEARCH_YET, user)
+        # 「还没结果」有两种，提示不能混：正在排队搜索 vs 压根没搜过。
+        # 混了会让人以为自己的搜索没被受理。
+        send_text(notices.SEARCH_PENDING if get_queue().has_pending_search(user)
+                  else notices.NO_SEARCH_YET, user)
         return
     if not state.results_fresh():
         state.items = []
@@ -349,40 +392,108 @@ def _handle_indices(content: str, user: str) -> None:
     if not picked:
         send_text(notices.INDEX_NOT_FOUND, user)
         return
-    _enqueue(picked, state, user, blind=False)
+
+    # 路径用**搜出这批结果的源**，不是「当前源」—— 用户完全可以在搜索后切源，
+    # 用当前源会把歌落进另一个源的目录。
+    source = state.items_source or state.source
+    keyword = state.keyword or '下载'
+    tasks: list[Task] = []
+    for song in picked:
+        tasks.append(Task(
+            kind=KIND_DOWNLOAD, user=user, title=_title_of(song),
+            source=source, keyword=keyword, song=song,
+            target_path=build_target_path(
+                source, keyword,
+                getattr(song, 'song_name', '') or '未知',
+                getattr(song, 'singers', '') or '未知',
+                str(getattr(song, 'ext', '') or 'mp3').lstrip('.'))))
+    _submit(tasks, user)
 
 
-def _enqueue(songs: list[Any], state: UserState, user: str, *, blind: bool) -> None:
-    """入队并回执。
+def _submit(tasks: list[Task], user: str) -> None:
+    """发回执 → 入队。
 
-    ⚠️ 顺序：**先算好队列数 → 发回执 → 再 submit**。
-    worker 一旦拿到任务就会立刻推「开始下载」，先入队会让用户先看到
-    「开始下载」再看到「已加入下载队列」，顺序是反的。
+    ⚠️ 顺序不能反：worker 一拿到任务就推「开始下载」，先入队会让用户先看到
+    「开始下载」再看到「已受理」。所以先占位次、发回执，再按位次入队。
     """
     queue = get_queue()
-    jobs: list[DownloadJob] = []
-    batch_keyword = state.keyword or '下载'
+    position = queue.reserve_position()
+    send_text(notices.accepted_text(position, tasks[0].title, count=len(tasks)), user)
+    logger.info('受理 %d 条任务（源 %s）：%s', len(tasks), tasks[0].source,
+                '、'.join(t.title for t in tasks))
+    for task in tasks:
+        queue.submit(task, position=position)
+        position = 0        # 只有第一条用预留位次，其余顺位递增
 
-    for song in songs:
-        title = _title_of(song)
-        target = build_target_path(state.source, batch_keyword,
-                                   getattr(song, 'song_name', '') or '未知',
-                                   getattr(song, 'singers', '') or '未知',
-                                   str(getattr(song, 'ext', '') or 'mp3').lstrip('.'))
-        jobs.append(DownloadJob(song=song, title=title, target_path=target,
-                                from_user=user, source_id=state.source,
-                                queued_at=time.time()))
 
-    queue_size = queue.pending() + len(jobs)
-    if blind:
-        send_text(notices.BLIND_QUEUED.format(count=queue_size, title=jobs[0].title), user)
+# --- 队列 worker 的实际执行 --------------------------------------------------
+
+def execute_task(task: Task) -> None:
+    """队列 worker 的回调：一条任务**完整**走完（pipeline 的不变量 1 与 4）。
+
+    这里的异常会被 worker 兜住然后继续跑下一个，所以每个分支都要自己把
+    「失败」变成一条给用户的消息，不能指望上层处理。
+    """
+    if task.kind == KIND_DOWNLOAD:
+        _run_download(task)
+    elif task.kind == KIND_BLIND:
+        _run_blind(task)
     else:
-        send_text(notices.queued_text(queue_size), user)
+        _run_search(task)
 
-    logger.info('入队 %d 首（来源 %s，盲模式=%s）：%s', len(jobs), state.source, blind,
-                '、'.join(job.title for job in jobs))
-    for job in jobs:
-        queue.submit(job)
+
+def _run_search(task: Task) -> None:
+    outcome = _search(task)
+    if outcome is None:
+        return
+    lines = [f'{idx}. {_title_of(song)}' for idx, song in enumerate(outcome.items, 1)]
+    send_text(notices.search_result_text(
+        source_name(task.source), lines, limit_hint=notices.SEARCH_HINT), task.user)
+
+
+def _run_blind(task: Task) -> None:
+    outcome = _search(task)
+    if outcome is None:
+        return
+    song = outcome.items[0]
+    title = _title_of(song)
+    target = build_target_path(
+        task.source, task.keyword,
+        getattr(song, 'song_name', '') or '未知',
+        getattr(song, 'singers', '') or '未知',
+        str(getattr(song, 'ext', '') or 'mp3').lstrip('.'))
+    send_text(notices.start_download_text(title), task.user)
+    download_and_report(song, title, target, task.user)
+
+
+def _run_download(task: Task) -> None:
+    send_text(notices.start_download_text(task.title), task.user)
+    download_and_report(task.song, task.title, task.target_path, task.user)
+
+
+def _search(task: Task):
+    """搜一次并写入该用户的结果槽。
+
+    失败/无结果时**在这里就把消息回了**，返回 None 表示没有结果可用。
+    结果槽写在搜索完成之后（不是入队时）—— 这样用户回数字时看到的一定是
+    已经搜出来的那批，而不是一个「说好了会有、其实还没搜」的空槽。
+    """
+    outcome = engine().search(task.source, task.keyword)
+    if not outcome.ok:
+        logger.warning('搜索失败（%s，源 %s）：%s', task.keyword, task.source, outcome.error)
+        send_text(notices.SEARCH_FAILED, task.user)
+        return None
+    if not outcome.items:
+        send_text(notices.BLIND_NO_RESULT.format(keyword=task.keyword)
+                  if task.kind == KIND_BLIND else notices.SEARCH_EMPTY, task.user)
+        return None
+
+    state = user_state(task.user)
+    state.items = outcome.items
+    state.keyword = task.keyword
+    state.items_source = task.source
+    state.at = time.time()
+    return outcome
 
 
 def _title_of(song: Any) -> str:
@@ -414,7 +525,7 @@ def _status_text(state: UserState) -> str:
     inflight, waiting = queue.snapshot()
     queue_line = f'待处理 {queue.pending()} 条'
     if inflight:
-        queue_line += f'（正在下载：{inflight}）'
+        queue_line += f'（正在处理：{inflight}）'
     if waiting:
         queue_line += f'，排队中 {len(waiting)} 条'
 
@@ -422,6 +533,9 @@ def _status_text(state: UserState) -> str:
     extra = [
         f'盲下载模式：{"已开启" if state.blind else "已关闭"}',
         f'搜索条数：{settings.search_limit}',
+        f'任务间隔：{settings.task_interval_seconds} 秒'
+        f'（/interval 可改）　单任务超时：{settings.task_timeout_minutes} 分钟'
+        f'（/timeout 可改）',
         f'引擎：{getattr(engine(), "_build_count", 0)} 次构建，'
         f'{engine().cache_stats()}',
     ]

@@ -4,7 +4,7 @@
 1. 日志与**配置自检**（缺项就打印清单退出）
 2. 读取运行期覆盖（`/limit` 改过的值）
 3. **更新自愈检查**：若上次更新后没能起来，先装回旧版本
-4. 初始化引擎与下载队列
+4. 初始化引擎与任务队列
 5. 清除「更新待验证」标记（能走到这里说明这次启动成功了）
 6. 起后台线程：启动消息 / Cookie 体检 / 定时巡检
 
@@ -36,7 +36,7 @@ if _missing:
 load_runtime_overrides()
 
 from app import commands, updater, wecom                              # noqa: E402
-from app.downloader import init_queue                                 # noqa: E402
+from app.pipeline import init_queue                                   # noqa: E402
 from app.router import callback as callback_router                    # noqa: E402
 from app.router import login_page as login_page_router                # noqa: E402
 from app.sources import SOURCE_META, SOURCE_ORDER                     # noqa: E402
@@ -128,8 +128,9 @@ async def lifespan(_app: FastAPI):
 
     try:
         init_queue()
-        logger.info('  引擎与下载队列就绪（源：%s，条数 %d）', _source_summary(),
-                    settings.search_limit)
+        logger.info('  引擎与任务队列就绪（源：%s，条数 %d，间隔 %d 秒，超时 %d 分钟）',
+                    _source_summary(), settings.search_limit,
+                    settings.task_interval_seconds, settings.task_timeout_minutes)
     except Exception as e:
         logger.error('  引擎初始化失败：%s', e, exc_info=True)
 

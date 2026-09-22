@@ -29,7 +29,8 @@ HELP_TEXT = """📖 musicbot 使用帮助
 1        下载第 1 首
 1,3,5    同时下载第 1、3、5 首
 
-下载在后台队列里按顺序进行，不用等它下完，可以继续搜索。
+所有任务（搜索与下载）都在同一个队列里**按发送顺序**一条条处理，
+发完可以继续发下一首，不用等。
 
 【音乐源】
 /qq      切换到 QQ音乐
@@ -39,6 +40,12 @@ HELP_TEXT = """📖 musicbot 使用帮助
 【搜索设置】
 /limit       查看当前搜索条数
 /limit 20    设置为 20 条（1-50）
+
+【任务节奏】
+/interval        查看任务之间的间隔
+/interval 5      设为 5 秒（0-60，0 = 不等待）
+/timeout         查看单任务超时
+/timeout 5       设为 5 分钟（1-10）
 
 【下载模式】
 /blind       查看盲下载模式状态
@@ -52,8 +59,8 @@ HELP_TEXT = """📖 musicbot 使用帮助
 /wyy login code <验证码>  网易云：用验证码完成登录（上一步之后）
 
 【队列】
-/queue   查看下载队列
-/cancel  清空还没开始下载的任务
+/queue   查看任务队列（正在处理 + 排队中）
+/cancel  清空还没开始的任务
 
 【其他】
 /status   查看运行状态
@@ -87,8 +94,9 @@ def startup_text(source_name: str, limit: int, cookie_lines: list[str] | None = 
         '⌨️ 常用指令',
         '━━━━━━━━━━━━━━━━━━',
         '/qq /wyy　切换搜索源',
-        '/blind　　开启盲下载（发歌名直接下第一首）',
+        '/blind　　开启盲下载（发歌名直接下第一首，可连发多首排队）',
         '/limit N　调整搜索条数（1-50）',
+        '/interval N /timeout N　任务间隔与单任务超时',
         '/qq login /wyy login　更新 Cookie',
         '/help　　 查看完整帮助',
     ]
@@ -113,13 +121,23 @@ NO_SEARCH_YET = '请先发送歌曲名称搜索，或直接回复搜索结果里
 INDEX_EXPIRED = '⏰ 搜索结果已过期，请重新发送歌曲名称搜索'
 INDEX_NOT_FOUND = '未找到对应的歌曲编号，请回复搜索结果里的数字'
 NOT_DOWNLOADABLE = '这首歌没有可用的下载地址，请换一首'
+# 用户回数字时，他那次搜索还在队列里没跑完 —— 不能回 NO_SEARCH_YET（会误导成
+# 「你没搜过」），要说清是"还在排队"。
+SEARCH_PENDING = '⏳ 你还有一次搜索在队列里等待，结果出来后再回复数字即可'
 
 
-# --- S3：下载队列 -----------------------------------------------------------
+# --- S3：任务队列（搜索与下载同一条流水线）---------------------------------
 
-def queued_text(count: int) -> str:
-    """count = 当前队列任务数（含正在下载的那首），不是用户选中的编号。"""
-    return f'🎧 已加入下载队列：{count}'
+def accepted_text(position: int, title: str, count: int = 1) -> str:
+    """入队回执。**在任务对 worker 可见之前发出**（见 pipeline 的不变量 2）。
+
+    position = 位次（1 = 下一个就轮到它），不是队列总数。
+    用户关心的是「我还要等几条」，所以报位次比报总数有用。
+    """
+    ahead = '（马上处理）' if position <= 1 else f'（前面还有 {position - 1} 条）'
+    if count > 1:
+        return f'🧾 已受理 {count} 首：{title} 等{ahead}'
+    return f'🧾 已受理：{title}{ahead}'
 
 
 def start_download_text(title: str) -> str:
@@ -134,10 +152,20 @@ def download_failed_text(title: str, reason: str) -> str:
     return f'❌ 下载失败：{title}\n原因：{reason}'
 
 
+def task_timeout_text(title: str, minutes: int) -> str:
+    return (f'⏰ 任务超时：{title}\n'
+            f'超过 {minutes} 分钟仍未完成，已跳过它去处理后面的任务。\n'
+            f'如果长时间没有新消息，可能是上游接口卡住了，可发送 /restart 重启服务。')
+
+
+def task_failed_text(title: str, reason: str) -> str:
+    return f'❌ 任务失败：{title}\n原因：{reason}'
+
+
 def queue_text(pending: int, inflight: str, waiting: list[str]) -> str:
-    lines = ['📋 下载队列', f'待处理共 {pending} 条']
+    lines = ['📋 任务队列', f'待处理共 {pending} 条']
     if inflight:
-        lines.append(f'正在下载：{inflight}')
+        lines.append(f'正在处理：{inflight}')
     if waiting:
         lines.append('排队中：')
         lines += [f'  {i}. {t}' for i, t in enumerate(waiting[:15], 1)]
@@ -148,8 +176,22 @@ def queue_text(pending: int, inflight: str, waiting: list[str]) -> str:
     return _clip('\n'.join(lines))
 
 
-QUEUE_CLEARED = '🧹 已清空待下载队列（正在下载的那首不受影响）'
-QUEUE_ALREADY_EMPTY = '队列里没有待下载的任务'
+QUEUE_CLEARED = '🧹 已清空待处理队列（正在处理的那条不受影响）'
+QUEUE_ALREADY_EMPTY = '队列里没有待处理的任务'
+
+
+def task_interval_status(value: int, lo: int, hi: int) -> str:
+    return (f'当前任务间隔：{value} 秒（范围 {lo}-{hi}，0 = 不等待）\n'
+            f'修改：/interval 5')
+
+
+def task_timeout_status(value: int, lo: int, hi: int) -> str:
+    return (f'当前单任务超时：{value} 分钟（范围 {lo}-{hi}）\n'
+            f'修改：/timeout 5')
+
+
+TASK_INTERVAL_SET = '✅ 任务间隔已设为 {value} 秒（下一个任务起生效）'
+TASK_TIMEOUT_SET = '✅ 单任务超时已设为 {value} 分钟（下一个任务起生效）'
 
 
 # --- S4：源、盲模式、Cookie -------------------------------------------------
@@ -166,13 +208,13 @@ def blind_mode_text(enabled: bool) -> str:
     if enabled:
         return ('✅ 已开启盲下载模式\n'
                 '现在直接发送歌曲名称，会自动下载搜索结果里的第 1 首。\n'
+                '可以一次连发多首，会按发送顺序排队处理。\n'
                 '关闭请发送 /blind off')
     return '⏸️ 已关闭盲下载模式，恢复为「先搜索、再回复数字」'
 
 
 BLIND_MODE_STATUS = '盲下载模式：{state}'
 BLIND_NO_RESULT = '❌ 没有搜到「{keyword}」，换个歌名或换源（/qq /wyy）试试'
-BLIND_QUEUED = '🎧 已加入下载队列：{count}（盲选：{title}）'
 
 
 def login_start_text(source_name: str, page_url: str = '', *,

@@ -152,10 +152,15 @@ def main() -> int:
         return 1
 
     work_dir = os.path.dirname(path)
+    # build_target_path 返回的是 downloads/{源客户端}/{批次 关键词}/{文件}，
+    # 所以「文件所在目录」就已经是批次目录了（原来多剥了一层）。
+    # 另外批次目录是 `{时间戳} {关键词}` —— 关键词在**尾部**，所以只能是
+    # endswith，不能是 startswith。这条断言从写出来那天起就一直红着。
+    batch = os.path.basename(work_dir)
     check('目录结构符合预期（源/批次关键词/）',
-          os.path.basename(os.path.dirname(work_dir)).startswith(keyword)
-          and os.path.basename(os.path.dirname(os.path.dirname(work_dir))) == 'QQMusicClient',
-          os.path.relpath(work_dir, ROOT))
+          batch.endswith(keyword) and ' ' in batch.strip()
+          and os.path.basename(os.path.dirname(work_dir)) == 'QQMusicClient',
+          f'{os.path.relpath(work_dir, ROOT)}　批次目录={batch}')
     check('文件名是「歌名 - 歌手.ext」',
           os.path.basename(path).startswith(getattr(song, 'song_name', '')),
           os.path.basename(path))

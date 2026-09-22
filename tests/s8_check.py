@@ -150,7 +150,8 @@ def main() -> int:
                        ("app/router/login_page.py", "扫码页"),
                        ("app/updater.py", "版本更新"),
                        ("app/runtime.py", "重启"),
-                       ("app/downloader.py", "下载队列")):
+                       ("app/pipeline.py", "统一任务队列"),
+                       ("app/downloader.py", "下载执行")):
         check(f"{name}（{path}）在镜像内", os.path.basename(path) in inside(f"ls {path}"))
     check("依赖：cryptography <47", inside(
         "python -c 'import importlib.metadata as m;print(m.version(\"cryptography\"))'").startswith("46."),
@@ -216,7 +217,7 @@ def main() -> int:
     logs = run([DOCKER, "logs", CONTAINER])
     log_text = (logs.stdout or "") + (logs.stderr or "")
     check("日志显示版本与配置检查通过",
-          f"musicbot v{BOT_VERSION} 启动中" in log_text and "引擎与下载队列就绪" in log_text,
+          f"musicbot v{BOT_VERSION} 启动中" in log_text and "引擎与任务队列就绪" in log_text,
           [l for l in log_text.splitlines() if "启动中" in l][:1])
     check("日志无 Traceback", "Traceback" not in log_text)
 

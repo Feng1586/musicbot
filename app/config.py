@@ -21,6 +21,12 @@ DEFAULT_PIP_INDEX = 'https://pypi.tuna.tsinghua.edu.cn/simple'
 # 搜索条数上限：QQ 源实测 =100 会返回 0 条且不报错，50 是安全上限
 SEARCH_LIMIT_MIN, SEARCH_LIMIT_MAX = 1, 50
 
+# 任务节奏（/interval、/timeout 可改）
+# 间隔：两条任务之间歇多久。串行 + 间隔能显著降低被音乐平台风控的概率。
+TASK_INTERVAL_MIN, TASK_INTERVAL_MAX = 0, 60        # 秒
+# 单任务超时：一条任务超过这个时长就当它卡住了，放弃等待并处理下一个。
+TASK_TIMEOUT_MIN, TASK_TIMEOUT_MAX = 1, 10          # 分钟
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -92,6 +98,14 @@ class Settings:
         self.cookie_expired_years_fallback = _env_int(
             'MUSICBOT_COOKIE_TTL_HOURS', 48, minimum=1)   # 服务端不给 TTL 时的兜底
 
+        # --- 任务节奏（运行期可用 /interval、/timeout 改，会持久化）---
+        self.task_interval_seconds = _env_int('MUSICBOT_TASK_INTERVAL_SECONDS', 5,
+                                              minimum=TASK_INTERVAL_MIN,
+                                              maximum=TASK_INTERVAL_MAX)
+        self.task_timeout_minutes = _env_int('MUSICBOT_TASK_TIMEOUT_MINUTES', 5,
+                                             minimum=TASK_TIMEOUT_MIN,
+                                             maximum=TASK_TIMEOUT_MAX)
+
         # --- 路径与运维 ---
         self.data_dir = _env_str('MUSICBOT_DATA_DIR', os.path.join(PROJECT_ROOT, 'data'))
         self.download_dir = _env_str('MUSICBOT_DOWNLOAD_DIR', os.path.join(PROJECT_ROOT, 'downloads'))
@@ -144,6 +158,8 @@ class Settings:
             f'默认音乐源    : {self.default_source}',
             f'搜索条数      : {self.search_limit}（{SEARCH_LIMIT_MIN}-{SEARCH_LIMIT_MAX}）',
             f'结果缓存      : {self.result_cache_minutes} 分钟',
+            f'任务节奏      : 间隔 {self.task_interval_seconds} 秒 / '
+            f'单任务超时 {self.task_timeout_minutes} 分钟（串行，一条下完再下一条）',
             f'Cookie 巡检   : 每 {self.cookie_check_interval_minutes} 分钟',
             f'数据目录      : {self.data_dir}',
             f'下载目录      : {self.download_dir}',
@@ -182,6 +198,14 @@ def load_runtime_overrides() -> dict:
             settings.search_limit = max(SEARCH_LIMIT_MIN, min(value, SEARCH_LIMIT_MAX))
         except (TypeError, ValueError):
             pass
+    for key, lo, hi in (('task_interval_seconds', TASK_INTERVAL_MIN, TASK_INTERVAL_MAX),
+                        ('task_timeout_minutes', TASK_TIMEOUT_MIN, TASK_TIMEOUT_MAX)):
+        if key in data:
+            try:
+                value = int(data[key])
+            except (TypeError, ValueError):
+                continue
+            setattr(settings, key, max(lo, min(value, hi)))
     return data
 
 
