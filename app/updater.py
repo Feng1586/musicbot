@@ -13,10 +13,12 @@
 ------------------------------------------------------------------
 流程：更新前置 `data/.update_pending` 标记 → 用户 `/restart` → 启动时验证 → 通过就清标记。
 
-⚠️ **判据不是「标记在不在」，而是「这个标记已经被启动过几次」**：
+⚠️ **判据不是「标记在不在」，而是「这个标记被几个不同的进程启动过」**：
 标记在盘上是**正常状态**（刚装完、还没重启，或者重启后的这次启动就是来验证它的），
-所以**第一次**带着标记启动必须放行、不回滚；只有**第二次**还带着它启动，
-才说明上一次启动没走到验证那一步（进程挂了 / 引擎造不出来）→ 这才该回滚。
+所以**第一个**看到标记的进程必须放行、不回滚；只有**第二个**进程还看到它，
+才说明上一个进程没走到验证那一步（进程挂了 / 引擎造不出来）→ 这才该回滚。
+「不同进程」用 `_PROCESS_TOKEN` 区分 —— 同一进程内重复调用不算新的启动，
+因为 `uvicorn.run('main:app')` 那种字符串写法会让模块体被跑两遍（实测踩到过）。
 
 老实现只看「标记在不在」就回滚，于是「`/update confirm` → `/restart`」这条**正常流程
 100% 被自己回滚掉** —— 2026-09-23 用户实测（容器日志：回滚发生在
@@ -34,6 +36,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -48,6 +51,14 @@ PIP_TIMEOUT_SECONDS = 420
 
 # 带着标记最多允许启动几次而不回滚（1 = 给第一次启动机会）
 MAX_STARTUP_TRIES = 1
+
+# 本进程的唯一标识（模块导入时生成一次）。
+# 用途：`tries` 数的是「**不同的进程**带着标记启动过几次」。
+# 同一个进程里如果 `startup_guard()` 被调了两次，绝不能算两次 ——
+# 这在现实中真的发生过：`uvicorn.run('main:app')` 用字符串会让 uvicorn
+# **再 import 一次 main**，模块体被跑两遍 → guard 被调两次 → 正常更新被
+# 误判成"上次启动失败"而回滚（2026-09-23 线上实测）。
+_PROCESS_TOKEN = uuid.uuid4().hex
 
 _session = requests.Session()
 _session.trust_env = False
@@ -264,9 +275,15 @@ def startup_guard() -> str:
     except (TypeError, ValueError):
         tries = 0
 
+    # 同一个进程里重复调用（例如 main.py 被 import 了两遍）→ 已经计过数了，别再算。
+    # 少了这道保护，正常更新会被误判成"上次启动失败"。
+    if str(state.get('tries_token') or '') == _PROCESS_TOKEN:
+        return ''
+
     if tries < MAX_STARTUP_TRIES:
         # 第一次带着标记启动：给它机会，先别回滚
         state['tries'] = tries + 1
+        state['tries_token'] = _PROCESS_TOKEN
         _write_json(_state_path(), state)
         logger.info('检测到待验证的更新（%s → %s）：本次启动验证新版本，暂不回滚',
                     previous or '?', target or '?')

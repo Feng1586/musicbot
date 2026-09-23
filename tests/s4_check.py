@@ -461,13 +461,18 @@ def part_updater() -> None:
     check('F13 标记可清除', updater.pending_exists() is False)
     check('F14 无标记时启动自愈不动手', updater.startup_guard() == '')
 
-    # --- F15~F21：自愈回滚的**判据**（v1.0.7 修的线上事故）------------------------
+    # --- F15~F23：自愈回滚的**判据**（v1.0.7 修的线上事故）------------------------
     # 老实现只看「标记在不在」就回滚，于是「/update confirm → /restart」这条正常流程
     # 100% 被自己回滚掉（2026-09-23 用户实测：回滚发生在 uvicorn 打印
     # "Waiting for application startup" **之前**，新版本连一次启动机会都没有）。
-    # 正确判据是「带着标记启动过几次」：第一次放行，第二次才回滚。
+    # 正确判据是「**几个不同的进程**带着标记启动过」：第一个进程放行，第二个才回滚。
+    # 「不同进程」用 updater._PROCESS_TOKEN 区分，测试里手动换 token 来模拟重启。
     CUR = updater.installed_version()          # 测试环境里真实装着的版本
     assert CUR, '读不到 musicdl 版本，后面的用例没法跑'
+
+    def restart_process() -> None:
+        """模拟「容器重启了」——换一个进程令牌才算新的一次启动。"""
+        updater._PROCESS_TOKEN = f'test-{os.urandom(6).hex()}'
 
     def installed_by_pip() -> str:
         """最近一次 pip 调用装的 musicdl 版本串，用来断言到底装了什么。"""
@@ -477,11 +482,12 @@ def part_updater() -> None:
                     return token
         return ''
 
-    # 时序 A：正常更新 → 重启 → 第一次启动**不该**回滚 → 验证通过 → 清标记
+    # 时序 A：正常更新 → 重启 → 第一个进程**不该**回滚 → 验证通过 → 清标记
+    restart_process()
     updater.mark_pending('9.9.9', CUR)
     pip_calls.clear()
     note = updater.startup_guard()
-    check('F15 第一次带着标记启动不回滚（这是本次启动来验证新版本）',
+    check('F15 第一个带着标记启动的进程不回滚（它就是来验证新版本的）',
           note == '' and updater.pending_exists() and not pip_calls,
           f'note={note!r} pip={pip_calls}')
     check('F16 启动次数被记下来（tries=1）', updater.pending_tries() == 1,
@@ -491,18 +497,34 @@ def part_updater() -> None:
           note == '' and not updater.pending_exists() and not pip_calls,
           f'note={note!r} pending={updater.pending_exists()}')
 
-    # 时序 B：更新后第一次启动**没走到验证**（进程挂了）→ 再启动才回滚
+    # 时序 A2（**线上真实踩的那个坑**）：同一个进程里 guard 被调两次
+    # 起因：`uvicorn.run('main:app')` 用字符串 → uvicorn 再 import 一次 main
+    #      → 模块体跑两遍 → guard 被调两次。第二次绝不能算成"新的启动"。
+    restart_process()
     updater.mark_pending('9.9.9', CUR)
-    updater.startup_guard()                    # 第一次：放行，然后"挂了"（不调 finish）
     pip_calls.clear()
-    note = updater.startup_guard()             # 第二次
-    check('F18 第二次还带着标记才回滚（上次启动确实没起来）',
+    n1 = updater.startup_guard()
+    n2 = updater.startup_guard()               # 同一进程第二次调用
+    check('F18 同进程内重复调用不被当成「上次启动失败」（线上那个坑）',
+          n1 == '' and n2 == '' and updater.pending_tries() == 1 and not pip_calls,
+          f'n1={n1!r} n2={n2!r} tries={updater.pending_tries()} pip={pip_calls}')
+    check('F18 引擎仍未清标记（等启动尾部真验证）', updater.pending_exists())
+
+    # 时序 B：更新后第一个进程**没走到验证**（进程挂了）→ 第二个进程才回滚
+    restart_process()
+    updater.mark_pending('9.9.9', CUR)
+    updater.startup_guard()                    # 第一个进程：放行，然后"挂了"（不调 finish）
+    pip_calls.clear()
+    restart_process()                          # ← 换进程 = 重启
+    note = updater.startup_guard()             # 第二个进程
+    check('F19 第二个进程还带着标记才回滚（上次启动确实没起来）',
           bool(pip_calls) and '9.9.9' in installed_by_pip()
           and not updater.pending_exists(),
           f'pip={installed_by_pip()} note={note[:40]!r}')
     check('F19 回滚提示说清了「上次启动失败」', '启动失败' in note, note[:60])
 
     # 时序 C：验证探针**不通过** → 立刻回滚（不用再等一次重启）
+    restart_process()
     updater.mark_pending('9.9.9', CUR)
     updater.startup_guard()
     pip_calls.clear()
@@ -514,6 +536,7 @@ def part_updater() -> None:
     check('F20 提示里带上了自检失败原因', '自检未通过' in note, note[:70])
 
     # 时序 D：标记要求的版本没保住（容器被重建，可写层没了）→ 说明原因、不回滚
+    restart_process()
     updater.mark_pending('9.9.9', '99.9.9')
     updater.startup_guard()
     pip_calls.clear()
@@ -523,14 +546,16 @@ def part_updater() -> None:
           and not updater.pending_exists(),
           f'note={note[:60]!r} pip={pip_calls}')
 
-    # 标记在但没有旧版本记录 → 第二次启动才提示，且不会乱装包
+    # 标记在但没有旧版本记录 → 第二个进程才提示，且不会乱装包
+    restart_process()
     updater.mark_pending('', '99.0.0')
     first = updater.startup_guard()
-    check('F22 无旧版本记录时第一次启动也不回滚',
+    check('F22 无旧版本记录时第一个进程也不回滚',
           first == '' and updater.pending_exists())
     pip_calls.clear()
+    restart_process()
     note = updater.startup_guard()
-    check('F22 第二次启动给出「没有可回滚记录」的明确提示',
+    check('F22 第二个进程给出「没有可回滚记录」的明确提示',
           '没有可回滚' in note and not updater.pending_exists(), note[:50])
     check('F22 自愈过程中没有真的装包（隔离）', not pip_calls, pip_calls)
 

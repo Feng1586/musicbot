@@ -219,5 +219,10 @@ def index() -> str:
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run('main:app', host=settings.host, port=settings.port,
+    # ⚠️ 必须传 app **对象**，不能用 `'main:app'` 这种字符串。
+    # 用字符串时 uvicorn 会**再 import 一次 main**，本模块的顶层代码会被执行**两遍**
+    # —— 实测后果（2026-09-23 线上）：`startup_guard()` 被调两次，第二次把正常更新
+    # 误判成「上次启动失败」而回滚，于是 `/update` 永远不生效。
+    # 传对象则不会二次 import（reload/多 worker 才需要字符串，本项目都不需要）。
+    uvicorn.run(app, host=settings.host, port=settings.port,
                 log_level=settings.log_level.lower())
