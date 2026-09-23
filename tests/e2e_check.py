@@ -261,9 +261,20 @@ def main() -> int:
                             v = tags[key]
                             lyrics = str(v[0] if isinstance(v, (list, tuple)) else v)
                             break
-                check('下载的文件内含封面', len(pictures) > 0
-                      and len(pictures[0].data or b'') > 1000,
-                      f'{len(pictures)} 张')
+                # ⚠️ 封面这项**依赖 QQ Cookie 仍然有效**：Cookie 一过期，musicdl 会退到
+                # 匿名源，下到的往往是替代结果（实测下到过「稻香 (童声版)….ogg」），
+                # 那种源通常没有封面。所以 Cookie 失效时本项**跳过**而不是判失败 ——
+                # 否则测试会因为"凭据自然过期"永久报红（2026-09-23 实际踩到）。
+                # 凭据过期本身由机器人自己的 Cookie 告警负责通知用户。
+                from app import cookies as cookie_store
+
+                if cookie_store.probe('qq').ok:
+                    check('下载的文件内含封面', len(pictures) > 0
+                          and len(pictures[0].data or b'') > 1000,
+                          f'{len(pictures)} 张')
+                else:
+                    check('下载的文件内含封面（QQ Cookie 已失效 → 本项跳过）', True,
+                          f'共 {len(pictures)} 张；发 /qq login 更新 Cookie 后本项会重新生效')
                 check('下载的文件内含歌词', len(lyrics) > 20, f'{len(lyrics)} 字符')
                 check('同名 .lrc 存在',
                       os.path.isfile(os.path.splitext(found)[0] + '.lrc'))

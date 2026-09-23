@@ -311,7 +311,9 @@ UPDATE_RISK_TEXT = """⚠️ 更新 musicdl 前请先读这段
 4. 若与锁定依赖冲突（例如 cryptography<47），会被自动拦下。
 
 【已做的保护】
-· 更新前会记录当前版本，启动失败会自动装回该版本
+· 更新前会记录当前版本
+· **重启时会自动验证新版本能不能用**（真的构造引擎检查 API，不只看版本号）；
+  验证不通过会自动装回旧版本，并在启动消息里告诉你
 · 可随时用 /update rollback 手动回滚
 
 确认执行请回复：/update confirm"""
@@ -320,11 +322,13 @@ UPDATE_NOT_AVAILABLE = '当前 musicdl 已是最新版本（{current}），无�
 UPDATE_CHECK_FAILED = '无法获取 musicdl 版本信息（{reason}），请稍后再试'
 UPDATE_CONFLICT = '❌ 更新已中止：{reason}'
 UPDATE_DONE = ('✅ musicdl 已更新：{old} → {new}\n'
-               '更新需要重启服务才会生效：\n'
+               '重启后生效。重启时会自动验证新版本能不能用，验证不通过会自动回滚。\n'
                '· 发送 /restart 立即重启\n'
                '· 或手动重启容器（docker restart）')
 UPDATE_ROLLBACK_DONE = '↩️ 已回滚到 musicdl {version}，重启后生效'
 UPDATE_ROLLBACK_NONE = '没有可回滚的版本记录'
+UPDATE_PENDING = ('⏳ musicdl {target} 已装好，等重启验证（发送 /restart 生效）。\n'
+                  '重启时若验证不通过会自动回滚到 {previous}')
 
 RESTART_NOTICE = '🔄 正在重启服务…（约 10 秒后可用）'
 RESTART_NO_SOCKET = ('🔄 未挂载 docker.sock，将以退出进程的方式重启。\n'

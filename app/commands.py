@@ -26,7 +26,7 @@ from app.login import manager as login_manager
 from app.pipeline import (KIND_BLIND, KIND_DOWNLOAD, KIND_SEARCH, Task,
                           get_queue)
 from app.runtime import restart
-from app.sources import SOURCE_META, SOURCE_ORDER, engine
+from app.sources import SOURCE_META, SOURCE_ORDER, compat_report, engine
 from app.wecom import send_text
 from utils.logger import logger
 
@@ -327,6 +327,13 @@ def _handle_update(args: list[str], user: str) -> None:
             send_text(notices.UPDATE_ROLLBACK_DONE.format(version=detail), user)
         return
 
+    # 待验证状态要能一眼看到 —— 否则用户会以为"更新没生效"而去反复重试
+    if updater.pending_exists():
+        send_text(notices.UPDATE_PENDING.format(
+            target=updater.pending_target() or '?',
+            previous=updater.previous_version() or '?'), user)
+        return
+
     check = updater.check()
     if check.error:
         send_text(f'当前 musicdl：{check.current or "未知"}\n'
@@ -542,6 +549,16 @@ def _status_text(state: UserState) -> str:
     if not check.error:
         extra.append(f'musicdl：{check.current}'
                      + (f'（有新版本 {check.latest}）' if check.has_update else '（已是最新）'))
+    if updater.pending_exists():
+        extra.append(f'⏳ 待验证更新：{updater.pending_target() or "?"}'
+                     f'（重启后自动验证，失败会回滚到 {updater.previous_version() or "?"}）')
+    # 引擎自检只在**没通过**时才显示 —— 通过是常态，不必占一行
+    try:
+        ok, detail = compat_report()
+    except Exception as e:
+        ok, detail = False, str(e)
+    if not ok:
+        extra.append(f'⚠️ musicdl 自检未通过：{detail}')
     return notices.status_text(source_name(state.source), lines, queue_line, extra)
 
 

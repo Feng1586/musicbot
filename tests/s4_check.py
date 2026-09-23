@@ -142,8 +142,12 @@ def part_probe() -> None:
 
     qq = cs.load('qq')
     res = cs.probe('qq')
-    check('B1 QQ（有真 Cookie）判定为可用', res.ok is True,
-          f'账号={qq.account} {res.reason or "ok"}')
+    # ⚠️ 这条不能写死"必须可用"：Cookie 会自然过期，写死了就永远报红
+    # （2026-09-23 实际踩到 —— QQ Cookie 过期后这里 FAIL，看着像代码坏了）。
+    # 这条要验证的是「探针能对真 Cookie 给出明确结论、不抛异常」。
+    check('B1 QQ（有真 Cookie）探针给出明确结论',
+          res.ok in (True, False) and (res.ok or bool(res.reason)),
+          f'账号={qq.account} → {"可用" if res.ok else "不可用：" + res.reason}')
     check('B2 QQ 显示了剩余有效期', '未知' not in qq.expiry_text() or qq.key_expires_in == 0,
           qq.expiry_text())
 
@@ -394,7 +398,12 @@ def part_updater() -> None:
     check('F2 能查官方 PyPI', bool(latest) and not error, f'{latest} {error}')
 
     real_check = updater.check()
-    check('F3 当前就是最新版（不谎报更新）', real_check.has_update is False,
+    # ⚠️ 不能断言"当前就是最新版" —— 那取决于 PyPI 此刻发没发新版，
+    # 项目一发新版这条就红（2026-09-23 实际踩到：musicdl 2.14.0 一发布这里就 FAIL）。
+    # 要验证的是「版本相同 → 不提示更新」这条逻辑，所以把"最新版"打桩成本地版本。
+    updater.fetch_latest = lambda timeout=20: (updater.installed_version(), '')   # type: ignore
+    same_check = updater.check()
+    check('F3 版本相同时不谎报更新', same_check.has_update is False,
           f'本地 {real_check.current} / 官方 {real_check.latest}')
     check('F4 无更新时启动消息不显示升级提示', updater.update_line() == '')
 
@@ -452,13 +461,84 @@ def part_updater() -> None:
     check('F13 标记可清除', updater.pending_exists() is False)
     check('F14 无标记时启动自愈不动手', updater.startup_guard() == '')
 
-    # 自愈：标记在但没有旧版本记录 → 提示并清标记（不会乱装包）
-    updater.mark_pending('', '99.0.0')
-    note = updater.startup_guard()
-    check('F15 上次更新失败会自愈（无记录时明确提示）',
-          '上次更新' in note and not updater.pending_exists(), note[:50])
-    check('F15 自愈过程中没有真的装包（隔离）', not pip_calls, pip_calls)
+    # --- F15~F21：自愈回滚的**判据**（v1.0.7 修的线上事故）------------------------
+    # 老实现只看「标记在不在」就回滚，于是「/update confirm → /restart」这条正常流程
+    # 100% 被自己回滚掉（2026-09-23 用户实测：回滚发生在 uvicorn 打印
+    # "Waiting for application startup" **之前**，新版本连一次启动机会都没有）。
+    # 正确判据是「带着标记启动过几次」：第一次放行，第二次才回滚。
+    CUR = updater.installed_version()          # 测试环境里真实装着的版本
+    assert CUR, '读不到 musicdl 版本，后面的用例没法跑'
 
+    def installed_by_pip() -> str:
+        """最近一次 pip 调用装的 musicdl 版本串，用来断言到底装了什么。"""
+        for cmd in reversed(pip_calls):
+            for token in cmd:
+                if token.startswith('musicdl=='):
+                    return token
+        return ''
+
+    # 时序 A：正常更新 → 重启 → 第一次启动**不该**回滚 → 验证通过 → 清标记
+    updater.mark_pending('9.9.9', CUR)
+    pip_calls.clear()
+    note = updater.startup_guard()
+    check('F15 第一次带着标记启动不回滚（这是本次启动来验证新版本）',
+          note == '' and updater.pending_exists() and not pip_calls,
+          f'note={note!r} pip={pip_calls}')
+    check('F16 启动次数被记下来（tries=1）', updater.pending_tries() == 1,
+          str(updater.pending_tries()))
+    note = updater.finish_update_startup(probe=lambda: (True, '（打桩）自检通过'))
+    check('F17 启动尾部验证通过 → 清标记、无异常提示',
+          note == '' and not updater.pending_exists() and not pip_calls,
+          f'note={note!r} pending={updater.pending_exists()}')
+
+    # 时序 B：更新后第一次启动**没走到验证**（进程挂了）→ 再启动才回滚
+    updater.mark_pending('9.9.9', CUR)
+    updater.startup_guard()                    # 第一次：放行，然后"挂了"（不调 finish）
+    pip_calls.clear()
+    note = updater.startup_guard()             # 第二次
+    check('F18 第二次还带着标记才回滚（上次启动确实没起来）',
+          bool(pip_calls) and '9.9.9' in installed_by_pip()
+          and not updater.pending_exists(),
+          f'pip={installed_by_pip()} note={note[:40]!r}')
+    check('F19 回滚提示说清了「上次启动失败」', '启动失败' in note, note[:60])
+
+    # 时序 C：验证探针**不通过** → 立刻回滚（不用再等一次重启）
+    updater.mark_pending('9.9.9', CUR)
+    updater.startup_guard()
+    pip_calls.clear()
+    note = updater.finish_update_startup(probe=lambda: (False, 'MusicClient 缺少 .search'))
+    check('F20 自检不通过时立刻回滚到旧版本',
+          bool(pip_calls) and '9.9.9' in installed_by_pip()
+          and not updater.pending_exists(),
+          f'pip={installed_by_pip()} note={note[:50]!r}')
+    check('F20 提示里带上了自检失败原因', '自检未通过' in note, note[:70])
+
+    # 时序 D：标记要求的版本没保住（容器被重建，可写层没了）→ 说明原因、不回滚
+    updater.mark_pending('9.9.9', '99.9.9')
+    updater.startup_guard()
+    pip_calls.clear()
+    note = updater.finish_update_startup(probe=lambda: (True, 'x'))
+    check('F21 目标版本没保住时明确说明且不回滚（可写层丢了）',
+          '没有保住' in note and '99.9.9' in note and not pip_calls
+          and not updater.pending_exists(),
+          f'note={note[:60]!r} pip={pip_calls}')
+
+    # 标记在但没有旧版本记录 → 第二次启动才提示，且不会乱装包
+    updater.mark_pending('', '99.0.0')
+    first = updater.startup_guard()
+    check('F22 无旧版本记录时第一次启动也不回滚',
+          first == '' and updater.pending_exists())
+    pip_calls.clear()
+    note = updater.startup_guard()
+    check('F22 第二次启动给出「没有可回滚记录」的明确提示',
+          '没有可回滚' in note and not updater.pending_exists(), note[:50])
+    check('F22 自愈过程中没有真的装包（隔离）', not pip_calls, pip_calls)
+
+    for _p in (updater._state_path(), updater._pending_marker()):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
     updater._run_pip = orig_run_pip
 
 

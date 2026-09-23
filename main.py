@@ -43,7 +43,29 @@ from app.sources import SOURCE_META, SOURCE_ORDER                     # noqa: E4
 from utils.version import __version__                                 # noqa: E402
 
 # 上次更新后没能启动 → 先回滚（这一步要在任何 musicdl 调用之前）
+# ⚠️ 它只在「标记已被启动过一次、这次还带着它」时才动手；第一次带标记启动是正常的
+#    （这次启动就是来验证新版本），不能回滚 —— 见 updater 的模块文档。
 _update_guard_note = updater.startup_guard()
+# 启动尾部（真验证）产生的话，也要一并带进启动消息
+_update_notes: list[str] = []
+
+
+def _finalize_update() -> None:
+    """启动走到这一步 → 对待验证的更新做一次**真检查**，再决定清标记还是回滚。
+
+    以前这里只无条件 `clear_pending()`：只要代码走到这行就当成"更新成功"，
+    哪怕 musicdl 装坏了、引擎根本建不起来也一样盖章 —— 那是错的。
+    """
+    if not updater.pending_exists():
+        return
+    try:
+        note = updater.finish_update_startup()
+    except Exception as e:
+        logger.error('  更新验证异常：%s', e, exc_info=True)
+        return
+    if note:
+        logger.warning('  更新验证：%s', note.replace('\n', ' '))
+        _update_notes.append(note)
 
 for _path in (settings.data_dir, settings.download_dir,
               os.path.join(settings.data_dir, 'cookies')):
@@ -86,8 +108,9 @@ def _send_startup_messages() -> None:
             update_line = updater.update_line()
         except Exception as e:
             logger.debug('检查 musicdl 更新失败：%s', e)
-        if _update_guard_note:
-            update_line = (_update_guard_note + '\n' + update_line).strip()
+        notes = [n for n in (_update_guard_note, *_update_notes) if n]
+        if notes:
+            update_line = '\n'.join(notes + ([update_line] if update_line else []))
 
         wecom.broadcast_text(notices.startup_text(
             engine_name, settings.search_limit, update_line=update_line))
@@ -134,10 +157,8 @@ async def lifespan(_app: FastAPI):
     except Exception as e:
         logger.error('  引擎初始化失败：%s', e, exc_info=True)
 
-    # 能走到这里说明这次启动是成功的 → 清掉「更新待验证」标记
-    if updater.pending_exists():
-        updater.clear_pending()
-        logger.info('  本次启动成功，已清除更新待验证标记')
+    # 能走到这里说明这次启动基本是成功的 → 对待验证的更新做真检查
+    _finalize_update()
 
     threading.Thread(target=_send_startup_messages, daemon=True,
                      name='musicbot-startup').start()

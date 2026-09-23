@@ -212,6 +212,51 @@ class MusicEngine:
             return (f'搜索缓存 {len(self._cache)} 条'
                     f'（命中 {self._cache_hits} / 未命中 {self._cache_misses}）')
 
+    def compat_report(self) -> tuple[bool, str]:
+        """检查当前装着的 musicdl 是否满足**我们实际用到的那套 API**。
+
+        给 `updater.finish_update_startup()` 当"新版本到底能不能用"的判据。
+        为什么不能只看版本号：版本号对了但 API 变了照样会炸。
+        为什么不能只看"启动代码走到了这一行"：`init_queue()` 的异常是被吞掉的，
+        引擎造不出来也不会阻断启动。
+        """
+        import importlib.metadata as md
+
+        try:
+            from musicdl.musicdl import MusicClient
+            from musicdl.modules.utils.misc import IOUtils, sanitize_filepath
+            from musicdl.modules.utils.neteaseutils import WeapiCryptoUtils
+        except Exception as e:
+            return False, f'导入 musicdl 失败：{type(e).__name__}: {e}'
+
+        missing = [name for name, obj in (('MusicClient', MusicClient),
+                                          ('IOUtils', IOUtils),
+                                          ('sanitize_filepath', sanitize_filepath),
+                                          ('WeapiCryptoUtils', WeapiCryptoUtils))
+                   if obj is None]
+        if missing:
+            return False, f'musicdl 里缺少 {missing}'
+
+        with self._lock:
+            client = self._client
+        if client is None:
+            return False, '引擎未就绪（MusicClient 没能构造出来）'
+
+        for attr in ('search', 'download', 'music_clients'):
+            if not hasattr(client, attr):
+                return False, f'MusicClient 缺少 .{attr}'
+
+        registered = set(getattr(client, 'music_clients', {}) or {})
+        wanted = {SOURCE_META[s]['client'] for s in SOURCE_ORDER}
+        if not wanted <= registered:
+            return False, f'缺少音乐源：{sorted(wanted - registered)}'
+
+        try:
+            version = md.version('musicdl')
+        except Exception:
+            version = '未知'
+        return True, f'musicdl {version}，源 {sorted(registered)}'
+
     def invalidate_cache(self) -> None:
         with self._lock:
             self._cache.clear()
@@ -299,3 +344,15 @@ def engine() -> MusicEngine:
     if _engine is None:
         return init_engine('惰性初始化')
     return _engine
+
+
+def compat_report() -> tuple[bool, str]:
+    """当前引擎 + musicdl 的兼容性自检（给 updater 的更新验证用）。
+
+    自己不吞异常：调用方（`finish_update_startup`）需要拿到"没通过"这个结论。
+    引擎都建不起来时也算没通过 —— 那正是"新版本坏了"的表现。
+    """
+    try:
+        return engine().compat_report()
+    except Exception as e:
+        return False, f'自检异常：{type(e).__name__}: {e}'
