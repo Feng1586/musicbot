@@ -19,10 +19,19 @@ def _clip(text: str, limit: int = _HINT_LIMIT) -> str:
 
 # --- S1：基础 ---------------------------------------------------------------
 
-HELP_TEXT = """📖 musicbot 使用帮助
+# 帮助分两页：企微单条文本上限 2048 字节，全文 2100+ 会被强制截断。
+# 第 1 页 = 日常最常用的（搜索/下载/源/节奏/两种模式），
+# 第 2 页 = 登录、队列、状态与升级等用得少的。
+HELP_PAGES = (1, 2)
+HELP_PAGE_DEFAULT = 1
+
+_HELP_PAGE_1 = """📖 musicbot 使用帮助（1/2）
 
 【搜索】
 直接发送歌曲名称即可，例如：青花瓷
+搜索结果会显示「歌名-歌手-专辑」（单曲无专辑时只显示歌名-歌手）
+如需更精准，可从 QQ音乐复制整行歌曲信息直接发送：
+歌曲名：罗曼蒂克乌托邦 (Utopia)，歌手名：门尼，专辑名：门尼 (MONEY)
 
 【下载】
 回复搜索结果最前面的数字，多首用英文逗号分隔：
@@ -52,6 +61,16 @@ HELP_TEXT = """📖 musicbot 使用帮助
 /blind on    开启：之后发送歌名会直接下载搜索结果第 1 首
 /blind off   关闭
 
+【严格匹配模式】
+/match       查看严格匹配模式状态
+/match on    开启：必须按「歌曲名：X，歌手名：Y，专辑名：Z」格式发送，
+             且搜索结果歌名/歌手/专辑完全一致才会下载
+/match off   关闭（未开启时若按该格式发送，会自动整理成精准关键词搜索）
+
+发送 /help 2 查看第 2 页（登录 / 队列 / 状态 / 升级）"""
+
+_HELP_PAGE_2 = """📖 musicbot 使用帮助（2/2）
+
 【Cookie】
 /qq login     扫码登录 / 更新 QQ音乐 Cookie
 /wyy login    扫码登录 / 更新 网易云音乐 Cookie
@@ -68,7 +87,27 @@ HELP_TEXT = """📖 musicbot 使用帮助
 /update   检查 musicdl 版本更新
 /restart  重启服务（用于让更新生效）
 
-💡 搜索结果 5 分钟内有效，请及时回复数字下载"""
+【故障处理】
+· 搜索/下载失败：先看 /status 里 Cookie 是否失效，失效就 /xxx login 更新
+· 长时间没反应：可能是被平台风控或接口卡住，可 /restart 重启
+· 任务卡住不动：/queue 看队列，/cancel 清掉还没开始的，或 /restart
+
+💡 搜索结果 5 分钟内有效，请及时回复数字下载
+
+发送 /help 1 返回第 1 页"""
+
+
+def help_text(page: int = HELP_PAGE_DEFAULT) -> str:
+    """取某一页帮助。页码非法时回落到第 1 页，并在结尾提示。"""
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = HELP_PAGE_DEFAULT
+    if page == 2:
+        return _HELP_PAGE_2
+    if page == 1:
+        return _HELP_PAGE_1
+    return f'❌ 没有第 {page} 页，帮助只有 1~2 页。\n\n{_HELP_PAGE_1}'
 
 
 def startup_text(source_name: str, limit: int, cookie_lines: list[str] | None = None,
@@ -95,6 +134,7 @@ def startup_text(source_name: str, limit: int, cookie_lines: list[str] | None = 
         '━━━━━━━━━━━━━━━━━━',
         '/qq /wyy　切换搜索源',
         '/blind　　开启盲下载（发歌名直接下第一首，可连发多首排队）',
+        '/match　　严格匹配模式（按歌曲信息格式发送，完全一致才下载）',
         '/limit N　调整搜索条数（1-50）',
         '/interval N /timeout N　任务间隔与单任务超时',
         '/qq login /wyy login　更新 Cookie',
@@ -215,6 +255,50 @@ def blind_mode_text(enabled: bool) -> str:
 
 BLIND_MODE_STATUS = '盲下载模式：{state}'
 BLIND_NO_RESULT = '❌ 没有搜到「{keyword}」，换个歌名或换源（/qq /wyy）试试'
+
+
+# --- 严格匹配模式 -----------------------------------------------------------
+
+# 用户从 QQ 音乐复制出来的标准格式示例（文案里要给出，否则用户不知道该怎么写）
+MATCH_FORMAT_EXAMPLE = '歌曲名：罗曼蒂克乌托邦 (Utopia)，歌手名：门尼，专辑名：门尼 (MONEY)'
+
+MATCH_MODE_STATUS = '严格匹配模式：{state}'
+
+
+def match_mode_text(enabled: bool) -> str:
+    if enabled:
+        return ('✅ 已开启严格匹配模式\n'
+                '从现在起，必须严格按下面的格式发送歌曲信息：\n'
+                f'{MATCH_FORMAT_EXAMPLE}\n'
+                '（若单曲没有专辑，专辑名留空即可：\n'
+                '歌曲名：成长的路口，歌手名：咖啡因乐队，专辑名：）\n'
+                '搜索结果必须歌名、歌手、专辑完全一致才会下载，否则提示下载失败。\n'
+                '关闭请发送 /match off')
+    return '⏸️ 已关闭严格匹配模式，恢复为普通搜索'
+
+
+# 非严格模式下识别出用户用了该格式 → 告知已自动整理关键词
+def match_auto_keyword_text(keyword: str) -> str:
+    return f'🔍 已按歌曲信息整理关键词：{keyword}'
+
+
+MATCH_NEED_FORMAT = (
+    '❌ 已开启严格匹配模式，必须按下面的格式发送歌曲信息：\n'
+    f'{MATCH_FORMAT_EXAMPLE}\n'
+    '（专辑为空时留空即可：歌曲名：成长的路口，歌手名：咖啡因乐队，专辑名：）\n'
+    '如需普通搜索，请先发送 /match off')
+MATCH_BAD_FORMAT = (
+    '❌ 歌曲信息格式不完整，请按下面的格式发送：\n'
+    f'{MATCH_FORMAT_EXAMPLE}')
+
+STRICT_NO_MATCH = '❌ 没有找到与「{criteria}」歌名、歌手、专辑完全一致的歌曲'
+STRICT_DOWNLOAD_FAILED = (
+    '❌ 下载失败：没有找到与「{criteria}」歌名、歌手、专辑完全一致的歌曲\n'
+    '（严格匹配模式下不会下载相似版本，可换源 /qq /wyy 或关闭 /match off 后重试）')
+
+
+def strict_result_text(source_name: str, lines: list[str], *, limit_hint: str) -> str:
+    return _clip(f'🎯 {source_name} 严格匹配结果\n' + '\n'.join(lines) + f'\n{limit_hint}')
 
 
 def login_start_text(source_name: str, page_url: str = '', *,

@@ -170,10 +170,13 @@ def main() -> int:
         print('-' * 72)
         print('1. 启动消息')
         print('-' * 72)
-        broadcasts = wait_for(
-            lambda: [c for c, u in messages('@all') if '已启动' in c and 'Cookie' in c] or None, 30)
-        startup = wait_for(lambda: next((c for c, _u in messages('@all') if '已启动' in c), None), 5)
-        report = wait_for(lambda: next((c for c, _u in messages('@all') if 'Cookie 状态' in c), None), 5)
+        # ⚠️ 这两条是**分开**发的，不能要求同一条里既有「已启动」又有「Cookie」。
+        # 另外首次启动会同步做一次 Cookie 探活（要联网），可能慢到 1~2 分钟，
+        # 所以等待窗口给宽一点，别把「慢」误判成「没发」。
+        startup = wait_for(
+            lambda: next((c for c, _u in messages('@all') if '已启动' in c), None), 120)
+        report = wait_for(
+            lambda: next((c for c, _u in messages('@all') if 'Cookie 状态' in c), None), 30)
         check('启动广播已发出（含版本与教程）',
               bool(startup) and '当前版本' in startup and '使用教程' in startup,
               (startup or '').splitlines()[0] if startup else '(无)')

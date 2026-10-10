@@ -26,6 +26,7 @@ os.chdir(ROOT)
 
 import app.pipeline as pipeline                          # noqa: E402
 from app import commands, notices                        # noqa: E402
+from app.commands import user_state                      # noqa: E402
 from app.config import (SEARCH_LIMIT_MAX, save_runtime_override,   # noqa: E402
                         settings)
 from app.pipeline import get_queue, init_queue            # noqa: E402
@@ -64,11 +65,11 @@ def wait_msgs(user: str, count: int, timeout: float = 20) -> list[str]:
     return messages_of(user)
 
 
-def make_song(index: int, name: str = '') -> SimpleNamespace:
+def make_song(index: int, name: str = '', *, singers: str = '', album: str | None = '专辑') -> SimpleNamespace:
     return SimpleNamespace(
-        song_name=name or f'测试歌{index}', singers=f'歌手{index}',
+        song_name=name or f'测试歌{index}', singers=singers or f'歌手{index}',
         ext='flac', source='QQMusicClient', download_url='http://fake/song',
-        with_valid_download_url=True, album='专辑', lyric='[00:01]la',
+        with_valid_download_url=True, album=album, lyric='[00:01]la',
     )
 
 
@@ -133,7 +134,7 @@ def main() -> int:
           first[0] if first else '(无)')
     msgs = wait_msgs(user, 2)
     check('随后收到编号列表',
-          len(msgs) == 2 and msgs[1].startswith('🎵 ') and '1. 青花瓷1-歌手1' in msgs[1],
+          len(msgs) == 2 and msgs[1].startswith('🎵 ') and '1. 青花瓷1-歌手1-专辑' in msgs[1],
           ' | '.join(m.split('\n')[0][:26] for m in msgs))
 
     # --- 2. 编号下载：三条消息 ---------------------------------------------
@@ -144,8 +145,8 @@ def main() -> int:
     msgs = wait_msgs(user, 3)
     check('消息顺序：受理 → 开始下载 → 下载完成',
           len(msgs) == 3
-          and msgs[0] == notices.accepted_text(1, '青花瓷2-歌手2')
-          and msgs[1].startswith('⚙️ 开始下载：青花瓷2-歌手2')
+          and msgs[0] == notices.accepted_text(1, '青花瓷2-歌手2-专辑')
+          and msgs[1].startswith('⚙️ 开始下载：青花瓷2-歌手2-专辑')
           and msgs[2].startswith('✅ 下载完成：') and '💾 大小：2.0 KB' in msgs[2],
           ' | '.join(m.split('\n')[0][:24] for m in msgs))
     check('回执里是歌名而不是用户回的编号', '青花瓷2' in msgs[0], msgs[0])
@@ -170,10 +171,10 @@ def main() -> int:
     drain()
     starts = [m for m in messages_of(user) if m.startswith('⚙️')]
     check('开始下载的顺序 = 发送顺序',
-          starts == ['⚙️ 开始下载：稻香1-歌手1',
-                     '⚙️ 开始下载：晴天1-歌手1',
-                     '⚙️ 开始下载：七里香1-歌手1'],
-          ' | '.join(s[3:16] for s in starts))
+          starts == ['⚙️ 开始下载：稻香1-歌手1-专辑',
+                     '⚙️ 开始下载：晴天1-歌手1-专辑',
+                     '⚙️ 开始下载：七里香1-歌手1-专辑'],
+          ' | '.join(s[3:20] for s in starts))
     dones = [m for m in messages_of(user) if m.startswith('✅')]
     check('三首都下完了', len(dones) == 3, f'{len(dones)} 首')
 
@@ -362,9 +363,33 @@ def main() -> int:
     print('13. 通用指令')
     sent.clear()
     text(user, '/help')
-    check('/help 有内容', 'musicbot 使用帮助' in messages_of(user)[0])
-    check('/help 提到了 /interval 与 /timeout',
+    check('/help 默认给第 1 页', messages_of(user)[0].startswith('📖 musicbot 使用帮助（1/2）'),
+          messages_of(user)[0].splitlines()[0])
+    check('/help 第 1 页提到了 /interval 与 /timeout',
           '/interval' in messages_of(user)[0] and '/timeout' in messages_of(user)[0])
+    check('/help 第 1 页提到了 /match',
+          '/match' in messages_of(user)[0])
+    check('/help 第 1 页不超企微 2048 字节上限',
+          len(messages_of(user)[0].encode('utf-8')) <= 2048,
+          f'{len(messages_of(user)[0].encode("utf-8"))} 字节')
+    sent.clear()
+    text(user, '/help 2')
+    check('/help 2 给第 2 页', messages_of(user)[0].startswith('📖 musicbot 使用帮助（2/2）'),
+          messages_of(user)[0].splitlines()[0])
+    check('/help 第 2 页含登录与队列',
+          '/qq login' in messages_of(user)[0] and '/queue' in messages_of(user)[0])
+    check('/help 第 2 页不超企微 2048 字节上限',
+          len(messages_of(user)[0].encode('utf-8')) <= 2048,
+          f'{len(messages_of(user)[0].encode("utf-8"))} 字节')
+    sent.clear()
+    text(user, '/help 9')
+    check('/help 非法页码有提示并回落',
+          messages_of(user)[0].startswith('❌ 没有第 9 页')
+          and '使用帮助（1/2）' in messages_of(user)[0],
+          messages_of(user)[0].splitlines()[0])
+    sent.clear()
+    text(user, '/h')
+    check('/h 是 /help 的别名', messages_of(user)[0].startswith('📖 musicbot 使用帮助（1/2）'))
     sent.clear()
     text(user, '/version')
     check('/version 正确', messages_of(user)[0].startswith('musicbot v'))
@@ -377,6 +402,162 @@ def main() -> int:
     sent.clear()
     commands.handle_message({'MsgType': 'event', 'FromUserName': user, 'Content': ''})
     check('事件消息被忽略（不发消息）', not messages_of(user))
+
+    # --- 14. 搜索结果带专辑 -------------------------------------------------
+    print()
+    print('14. 搜索结果展示「歌名-歌手-专辑」')
+    text(user, '/blind off')      # 前面的小节把盲下打开了，这节要看到列表
+    sent.clear()
+    # 假搜索结果里前两首带专辑、第三首不带
+    def album_search(source_id: str, keyword: str, **_kw):
+        from app.sources import SearchOutcome
+        items = [
+            make_song(1, '有专辑', album='专辑A'),
+            make_song(2, '无专辑', album=''),
+            make_song(3, '空专辑', album=None),
+        ]
+        return SearchOutcome(items=items)
+
+    music_engine.search = album_search            # type: ignore[assignment]
+    text(user, '专辑测试')
+    msgs = wait_msgs(user, 2)
+    listing = msgs[1] if len(msgs) > 1 else ''
+    check('有专辑的显示三段', '1. 有专辑-歌手1-专辑A' in listing, listing.replace('\n', ' / ')[:70])
+    check('无专辑的只显示两段（没有多余的结尾横杠）',
+          '2. 无专辑-歌手2' in listing and '2. 无专辑-歌手2-' not in listing,
+          listing.replace('\n', ' / ')[:70])
+    check('专辑为 None 的也只显示两段', '3. 空专辑-歌手3' in listing
+          and '3. 空专辑-歌手3-' not in listing, listing.replace('\n', ' / ')[:70])
+    drain()
+    music_engine.search = fake_search             # type: ignore[assignment]
+
+    # --- 15. 严格匹配模式开关 ----------------------------------------------
+    print()
+    print('15. 严格匹配模式：开关与格式校验')
+    sent.clear()
+    text(user, '/match')
+    check('查询严格模式状态', messages_of(user)[0] == notices.MATCH_MODE_STATUS.format(state='已关闭'))
+    sent.clear()
+    text(user, '/match on')
+    check('开启严格模式有引导', messages_of(user)[0].startswith('✅ 已开启严格匹配模式')
+          and '歌曲名' in messages_of(user)[0], messages_of(user)[0][:30])
+    check('开关已生效', user_state(user).strict is True)
+
+    # 严格模式下发送非格式文本 → 拒绝
+    sent.clear()
+    text(user, '青花瓷')
+    check('严格模式下非格式输入被拒',
+          messages_of(user)[0].startswith('❌ 已开启严格匹配模式'), messages_of(user)[0][:40])
+    check('被拒后没有入队（队列还是空的）', get_queue().pending() == 0)
+
+    sent.clear()
+    text(user, '/match off')
+    check('关闭严格模式有提示',
+          messages_of(user)[0].startswith('⏸️ 已关闭严格匹配模式'))
+    check('开关已关闭', user_state(user).strict is False)
+
+    # --- 16. 未开启严格模式但用格式 → 自动整理关键词 ------------------------
+    print()
+    print('16. 未开严格模式用歌曲信息格式 → 自动整理关键词搜索')
+    captured: dict[str, str] = {}
+
+    def spy_search(source_id: str, keyword: str, **_kw):
+        captured['keyword'] = keyword
+        return fake_search(source_id, keyword)
+
+    music_engine.search = spy_search              # type: ignore[assignment]
+    sent.clear()
+    text(user, '歌曲名：罗曼蒂克乌托邦 (Utopia)，歌手名：门尼，专辑名：门尼 (MONEY)')
+    check('给出了「已整理关键词」的提示',
+          any('已按歌曲信息整理关键词' in m for m in messages_of(user)),
+          ' | '.join(m[:30] for m in messages_of(user)))
+    drain()
+    check('搜索用的关键词是三段空格拼接',
+          captured.get('keyword') == '罗曼蒂克乌托邦 (Utopia) 门尼 门尼 (MONEY)',
+          repr(captured.get('keyword')))
+    music_engine.search = fake_search             # type: ignore[assignment]
+
+    # --- 17. 严格匹配：盲下命中 / 不命中 -----------------------------------
+    print()
+    print('17. 严格匹配（盲下）：完全一致才下载')
+
+    def strict_blind_search(source_id: str, keyword: str, **_kw):
+        from app.sources import SearchOutcome
+        # 第一条是"像但不一样"（专辑不同），第二条才是完全一致的
+        items = [
+            make_song(1, '罗曼蒂克乌托邦 (Utopia)', singers='门尼', album='别的专辑'),
+            make_song(2, '罗曼蒂克乌托邦 (Utopia)', singers='门尼', album='门尼 (MONEY)'),
+        ]
+        return SearchOutcome(items=items)
+
+    music_engine.search = strict_blind_search     # type: ignore[assignment]
+    text(user, '/match on')
+    text(user, '/blind on')
+    sent.clear()
+    text(user, '歌曲名：罗曼蒂克乌托邦 (Utopia)，歌手名：门尼，专辑名：门尼 (MONEY)')
+    msgs = wait_msgs(user, 3)
+    starts = [m for m in msgs if m.startswith('⚙️')]
+    check('盲下选中了严格匹配的那首（跳过专辑不符的第一首）',
+          bool(starts) and '罗曼蒂克乌托邦 (Utopia)-门尼-门尼 (MONEY)' in starts[0],
+          ' | '.join(s[3:40] for s in starts))
+    check('最终下载完成', any(m.startswith('✅') for m in msgs),
+          ' | '.join(m.split('\n')[0][:30] for m in msgs))
+    drain()
+
+    # 不命中：全部结果的专辑都对不上
+    def strict_miss_search(source_id: str, keyword: str, **_kw):
+        from app.sources import SearchOutcome
+        items = [make_song(1, '罗曼蒂克乌托邦 (Utopia)', singers='门尼', album='完全不同的专辑')]
+        return SearchOutcome(items=items)
+
+    music_engine.search = strict_miss_search      # type: ignore[assignment]
+    sent.clear()
+    text(user, '歌曲名：罗曼蒂克乌托邦 (Utopia)，歌手名：门尼，专辑名：门尼 (MONEY)')
+    msgs = wait_msgs(user, 2)
+    check('没有完全一致的 → 提示下载失败',
+          any('下载失败' in m and '完全一致' in m for m in msgs),
+          ' | '.join(m.split('\n')[0][:36] for m in msgs))
+    check('失败时没有发起任何下载', not any(m.startswith('⚙️') for m in msgs))
+    drain()
+
+    # --- 18. 严格匹配：非盲下只列出匹配结果 --------------------------------
+    print()
+    print('18. 严格匹配（非盲下）：只列出完全一致的结果')
+    text(user, '/blind off')
+    text(user, '/match on')
+
+    def growup_search(source_id: str, keyword: str, **_kw):
+        from app.sources import SearchOutcome
+        items = [
+            make_song(1, '成长的路口', singers='别的乐队', album=''),     # 歌手不符（会被过滤）
+            make_song(2, '成长的路口', singers='咖啡因乐队', album=''),   # 匹配（专辑空）
+        ]
+        return SearchOutcome(items=items)
+
+    music_engine.search = growup_search           # type: ignore[assignment]
+    sent.clear()
+    text(user, '歌曲名：成长的路口，歌手名：咖啡因乐队，专辑名：')
+    msgs = wait_msgs(user, 2)
+    listing = msgs[1] if len(msgs) > 1 else ''
+    check('只列出严格匹配的那一条',
+          listing.startswith('🎯 ') and '1. 成长的路口-咖啡因乐队' in listing
+          and '别的乐队' not in listing,
+          listing.replace('\n', ' / ')[:70])
+    drain()
+
+    # 关键：列表里的编号必须与结果槽一致 —— 回「1」要下到匹配的那首，
+    # 而不是原始结果里的第一条（那首歌手不符）。
+    sent.clear()
+    text(user, '1')
+    msgs = wait_msgs(user, 3)
+    starts = [m for m in msgs if m.startswith('⚙️')]
+    check('严格结果里回编号下到的是**匹配项**，不是原始第一条',
+          bool(starts) and '咖啡因乐队' in starts[0] and '别的乐队' not in starts[0],
+          ' | '.join(s[3:40] for s in starts))
+    drain()
+
+    text(user, '/match off')
+    music_engine.search = fake_search             # type: ignore[assignment]
 
     print()
     print('=' * 72)

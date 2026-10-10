@@ -17,13 +17,15 @@ from typing import Any, Optional
 
 from app import cookies as cookie_store
 from app import notices
+from app import songinfo
 from app import updater
 from app.config import (SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, TASK_INTERVAL_MAX,
                         TASK_INTERVAL_MIN, TASK_TIMEOUT_MAX, TASK_TIMEOUT_MIN,
                         save_runtime_override, settings)
 from app.downloader import build_target_path, download_and_report
 from app.login import manager as login_manager
-from app.pipeline import (KIND_BLIND, KIND_DOWNLOAD, KIND_SEARCH, Task,
+from app.pipeline import (KIND_BLIND, KIND_DOWNLOAD, KIND_SEARCH,
+                          KIND_STRICT_BLIND, KIND_STRICT_SEARCH, Task,
                           get_queue)
 from app.runtime import restart
 from app.sources import SOURCE_META, SOURCE_ORDER, compat_report, engine
@@ -38,6 +40,9 @@ _INDEX_RE = re.compile(r'^[\d,，\s]+$')
 class UserState:
     source: str = ''
     blind: bool = False
+    # 严格匹配模式：只接「歌曲名：X，歌手名：Y，专辑名：Z」格式，
+    # 且要求搜索结果的三个字段严格一致才下载。见 app/songinfo.py。
+    strict: bool = False
     items: list = field(default_factory=list)
     keyword: str = ''
     # 这批结果是用哪个源搜出来的。**必须单独记**：用户搜完可以立刻切源，
@@ -112,7 +117,7 @@ def handle_error(msg: Optional[dict], error: Exception) -> None:
 def _handle_command(raw: str, user: str) -> None:
     parts = raw[1:].split()
     if not parts:
-        send_text(notices.HELP_TEXT, user)
+        send_text(notices.help_text(notices.HELP_PAGE_DEFAULT), user)
         return
 
     command = parts[0].lower()
@@ -125,7 +130,8 @@ def _handle_command(raw: str, user: str) -> None:
         return
 
     if command in ('help', 'h', '帮助'):
-        send_text(notices.HELP_TEXT, user)
+        page = args[0] if args else notices.HELP_PAGE_DEFAULT
+        send_text(notices.help_text(page), user)
     elif command in ('version', 'v', '版本'):
         send_text(notices.version_text(), user)
     elif command in ('status', '状态'):
@@ -140,6 +146,8 @@ def _handle_command(raw: str, user: str) -> None:
         _handle_timeout(args, user)
     elif command in ('blind', '盲下载'):
         _handle_blind(args, state, user)
+    elif command in ('match', '严格匹配', '严格'):
+        _handle_match(args, state, user)
     elif command in ('queue', '队列'):
         send_text(_queue_text(), user)
     elif command in ('cancel', '取消'):
@@ -300,6 +308,27 @@ def _handle_blind(args: list[str], state: UserState, user: str) -> None:
         send_text('用法：/blind on 或 /blind off', user)
 
 
+def _handle_match(args: list[str], state: UserState, user: str) -> None:
+    """严格匹配模式开关。
+
+    开启后用户必须按「歌曲名：X，歌手名：Y，专辑名：Z」格式输入，
+    否则拒绝搜索；搜到的结果也要三个字段严格一致才下载。
+    """
+    if not args:
+        send_text(notices.MATCH_MODE_STATUS.format(
+            state='已开启' if state.strict else '已关闭'), user)
+        return
+    value = args[0].lower()
+    if value in ('on', '1', 'true', '开', '开启'):
+        state.strict = True
+        send_text(notices.match_mode_text(True), user)
+    elif value in ('off', '0', 'false', '关', '关闭'):
+        state.strict = False
+        send_text(notices.match_mode_text(False), user)
+    else:
+        send_text('用法：/match on 或 /match off', user)
+
+
 def _handle_update(args: list[str], user: str) -> None:
     action = (args[0].lower() if args else '')
 
@@ -364,11 +393,44 @@ def _handle_text(content: str, user: str) -> None:
     ⚠️ 这里**不做搜索**。搜索以前跑在回调线程里、和下载抢同一把引擎锁，
     用户连发多首歌名时「等锁 + 搜索」整段时间一条反馈都发不出去，看着就像卡死。
     现在只做两件事：发回执、入队。
+
+    另外这里还负责「歌曲信息格式」的分流（见 `app/songinfo.py`）：
+    * 严格模式下：必须按格式来，否则**当场拒绝**（不入队，省钱省时间）；
+    * 非严格模式下：用户按了格式来 → 自动整理成 `歌名 歌手 专辑` 关键词搜索。
     """
     state = user_state(user)
+
+    if songinfo.looks_like_song_fields(content):
+        fields = songinfo.parse(content)
+        if not fields.has_song:
+            # 有标签但没有歌名 —— 格式残缺
+            send_text(notices.MATCH_BAD_FORMAT, user)
+            return
+        keyword = fields.keyword()
+        title = fields.display()
+        strict = state.strict
+        if not strict:
+            # 用户**没开**严格模式却用了这个格式 → 主动帮他整理关键词
+            # （这正是用户要的行为：更精准的搜索结果）
+            send_text(notices.match_auto_keyword_text(keyword), user)
+    elif state.strict:
+        # 严格模式但用户没按格式输入 → 拒绝
+        send_text(notices.MATCH_NEED_FORMAT, user)
+        return
+    else:
+        keyword = content
+        title = content
+        strict = False
+
     kind = KIND_BLIND if state.blind else KIND_SEARCH
-    _submit([Task(kind=kind, user=user, title=content,
-                  source=state.source, keyword=content)], user)
+    if strict and state.blind:
+        # 严格模式 + 盲下：搜到后要做严格匹配，所以用专门的 kind
+        kind = KIND_STRICT_BLIND
+    elif strict:
+        kind = KIND_STRICT_SEARCH
+    _submit([Task(kind=kind, user=user, title=title,
+                  source=state.source, keyword=keyword,
+                  strict=strict, fields=fields if strict else None)], user)
 
 
 def _handle_indices(content: str, user: str) -> None:
@@ -443,6 +505,10 @@ def execute_task(task: Task) -> None:
     """
     if task.kind == KIND_DOWNLOAD:
         _run_download(task)
+    elif task.kind == KIND_STRICT_BLIND:
+        _run_strict_blind(task)
+    elif task.kind == KIND_STRICT_SEARCH:
+        _run_strict_search(task)
     elif task.kind == KIND_BLIND:
         _run_blind(task)
     else:
@@ -478,7 +544,68 @@ def _run_download(task: Task) -> None:
     download_and_report(task.song, task.title, task.target_path, task.user)
 
 
-def _search(task: Task):
+def _run_strict_search(task: Task) -> None:
+    """严格匹配模式（只搜）：搜完后**只列出严格匹配的结果**。
+
+    一条都不匹配时直接告诉用户"没找到完全匹配的版本"，而不是把一堆
+    长得像的结果丢给他 —— 那等于严格模式没起作用。
+    """
+    outcome = _search(task, strict=True)
+    if outcome is None:
+        return
+    matched = _match_all(task)
+    if not matched:
+        send_text(notices.STRICT_NO_MATCH.format(
+            keyword=task.title, criteria=task.title), task.user)
+        return
+    # ⚠️ 必须把结果槽**换成 matched**：列表只展示了匹配项，用户回复的编号
+    # 是按这个列表数的。若仍留着全部结果，用户回「1」会下到没通过匹配的那首。
+    state = user_state(task.user)
+    state.items = matched
+    lines = [f'{idx}. {_title_of(song)}' for idx, song in enumerate(matched, 1)]
+    send_text(notices.strict_result_text(
+        source_name(task.source), lines, limit_hint=notices.SEARCH_HINT), task.user)
+
+
+def _run_strict_blind(task: Task) -> None:
+    """严格匹配模式（盲下）：搜完后只认**第一个严格匹配**的结果并下载。
+
+    不匹配就报「下载失败」，绝不退而求其次下个相似版本 —— 用户开严格模式
+    就是为了避免下错歌。
+    """
+    outcome = _search(task, strict=True)
+    if outcome is None:
+        return
+    matched = _match_all(task)
+    if not matched:
+        send_text(notices.STRICT_DOWNLOAD_FAILED.format(
+            keyword=task.title, criteria=task.title), task.user)
+        return
+    song = matched[0]
+    title = _title_of(song)
+    target = build_target_path(
+        task.source, task.keyword,
+        getattr(song, 'song_name', '') or '未知',
+        getattr(song, 'singers', '') or '未知',
+        str(getattr(song, 'ext', '') or 'mp3').lstrip('.'))
+    send_text(notices.start_download_text(title), task.user)
+    download_and_report(song, title, target, task.user)
+
+
+def _match_all(task: Task) -> list:
+    """从该用户最近一次搜索结果里挑出与用户给的三段严格一致的条目。"""
+    if task.fields is None:
+        return []
+    state = user_state(task.user)
+    matched = []
+    for song in state.items:
+        ok, _reason = songinfo.matches(task.fields, song)
+        if ok:
+            matched.append(song)
+    return matched
+
+
+def _search(task: Task, *, strict: bool = False):
     """搜一次并写入该用户的结果槽。
 
     失败/无结果时**在这里就把消息回了**，返回 None 表示没有结果可用。
@@ -491,8 +618,10 @@ def _search(task: Task):
         send_text(notices.SEARCH_FAILED, task.user)
         return None
     if not outcome.items:
-        send_text(notices.BLIND_NO_RESULT.format(keyword=task.keyword)
-                  if task.kind == KIND_BLIND else notices.SEARCH_EMPTY, task.user)
+        if task.kind in (KIND_BLIND, KIND_STRICT_BLIND):
+            send_text(notices.BLIND_NO_RESULT.format(keyword=task.keyword), task.user)
+        else:
+            send_text(notices.SEARCH_EMPTY, task.user)
         return None
 
     state = user_state(task.user)
@@ -504,8 +633,16 @@ def _search(task: Task):
 
 
 def _title_of(song: Any) -> str:
+    """展示用标题：歌名-歌手[-专辑]。
+
+    专辑是可选段：单曲可能没有专辑（用户明确说过"部分单曲没有专辑"），
+    这时不能硬拼出一个空的第三段（会出现 `歌名-歌手-` 这种尾巴）。
+    """
     name = getattr(song, 'song_name', '') or '未知'
     singers = getattr(song, 'singers', '') or '未知'
+    album = (getattr(song, 'album', '') or '').strip()
+    if album and album.lower() not in ('null', 'none'):
+        return f'{name}-{singers}-{album}'
     return f'{name}-{singers}'
 
 
@@ -539,6 +676,7 @@ def _status_text(state: UserState) -> str:
     check = updater.check()
     extra = [
         f'盲下载模式：{"已开启" if state.blind else "已关闭"}',
+        f'严格匹配模式：{"已开启" if state.strict else "已关闭"}',
         f'搜索条数：{settings.search_limit}',
         f'任务间隔：{settings.task_interval_seconds} 秒'
         f'（/interval 可改）　单任务超时：{settings.task_timeout_minutes} 分钟'

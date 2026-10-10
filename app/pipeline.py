@@ -48,8 +48,18 @@ from utils.logger import logger
 KIND_SEARCH = 'search'        # 普通搜索：搜完回编号列表，等用户回数字
 KIND_BLIND = 'blind'          # 盲下：搜完取第 1 首直接下载
 KIND_DOWNLOAD = 'download'    # 用户已选定某首，只下载
+# 严格匹配模式（见 app/songinfo.py）：搜完后要求歌名/歌手/专辑严格一致。
+# `_STRICT_BLIND` 下只认第一首严格匹配的结果，`_STRICT_SEARCH` 则把匹配的结果列出来。
+KIND_STRICT_BLIND = 'strict_blind'
+KIND_STRICT_SEARCH = 'strict_search'
 
-KIND_LABELS = {KIND_SEARCH: '搜索', KIND_BLIND: '盲下', KIND_DOWNLOAD: '下载'}
+KIND_LABELS = {KIND_SEARCH: '搜索', KIND_BLIND: '盲下', KIND_DOWNLOAD: '下载',
+               KIND_STRICT_BLIND: '严格盲下', KIND_STRICT_SEARCH: '严格搜索'}
+
+# 这些 kind 都要先搜一次（盲下与严格盲下在搜索后还会继续下载）
+SEARCH_KINDS = (KIND_SEARCH, KIND_BLIND, KIND_STRICT_SEARCH, KIND_STRICT_BLIND)
+# 这些 kind 属于「严格匹配」家族
+STRICT_KINDS = (KIND_STRICT_SEARCH, KIND_STRICT_BLIND)
 
 # /queue 里最多列几条排队中的任务
 MAX_WAITING_SHOWN = 15
@@ -59,11 +69,15 @@ MAX_WAITING_SHOWN = 15
 class Task:
     kind: str
     user: str
-    title: str                    # 回执与队列展示用（搜索=关键词，下载=歌名-歌手）
+    title: str                    # 回执与队列展示用（搜索=关键词，下载=歌名-歌手-专辑）
     source: str = ''              # ← 入队时快照
     keyword: str = ''
     song: Any = None              # musicdl 的 SongInfo 对象引用
     target_path: str = ''
+    # 严格匹配模式：入队时快照用户要求的三个字段（SongFields），
+    # worker 搜完后据此判断结果是否严格一致。None 表示不启用严格匹配。
+    strict: bool = False
+    fields: Any = None
     queued_at: float = 0.0
     seq: int = 0
 
@@ -149,19 +163,18 @@ class TaskQueue:
         return removed
 
     def has_pending_search(self, user: str) -> bool:
-        """该用户是否还有没跑完的搜索（含盲下，它们也要先搜）。
+        """该用户是否还有没跑完的搜索（含盲下/严格模式，它们也要先搜）。
 
         用来回答「用户回数字、但结果还没搜出来」这种情况 —— 此时应该提示
         「还在排队搜索中」，而不是误导性的「请先发送歌曲名称搜索」。
         """
-        kinds = (KIND_SEARCH, KIND_BLIND)
         with self._lock:
             current = self._inflight
-            if current is not None and current.user == user and current.kind in kinds:
+            if current is not None and current.user == user and current.kind in SEARCH_KINDS:
                 return True
         with self._queue.mutex:
             for task in self._queue.queue:
-                if task.user == user and task.kind in kinds:
+                if task.user == user and task.kind in SEARCH_KINDS:
                     return True
         return False
 
