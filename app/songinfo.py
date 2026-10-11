@@ -60,6 +60,19 @@ class SongFields:
         「罗曼蒂克乌托邦 (Utopia) 门尼 门尼 (MONEY)」）。"""
         return ' '.join(part for part in (self.song, self.singer, self.album) if part)
 
+    def search_keyword(self) -> str:
+        """自动下载（新歌首发 / 专辑）用的搜索关键词：**不带专辑**。
+
+        实测（2026-10-12，最新栏目前 8 首，搜索条数固定 8）：
+        把专辑拼进去反而**略降**命中率（全拼 6/8，歌名+歌手 7/8）——
+        QQ 搜索对超长关键词的召回更差。所以这里只用「歌名 歌手」。
+
+        为什么这样是安全的：关键词只影响**能不能搜到**，
+        而"是不是这首歌"始终由 `matches()` 用完整三段来判定，
+        所以省掉专辑不会让错版本被下载。
+        """
+        return ' '.join(part for part in (self.song, self.singer) if part)
+
     def display(self) -> str:
         """给回执/队列展示用的短标题：歌名-歌手[-专辑]。"""
         parts = [self.song or '未知', self.singer or '未知']

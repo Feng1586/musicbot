@@ -19,6 +19,11 @@ logs/
 .wb_*
 .wb-*
 
+# 抓包文件绝不能进镜像：y.qq.com.har 有 38MB 且**含真实 Cookie**
+# （`COPY . .` 会把它一起搬进去，镜像体积和凭据泄露两头都亏）
+*.har
+*.har.zip
+
 # Python 缓存（含子目录）
 **/__pycache__/
 **/*.py[cod]

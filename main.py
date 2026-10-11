@@ -133,6 +133,19 @@ def _cookie_watch_loop() -> None:
             logger.warning('Cookie 巡检失败：%s', e)
 
 
+def _newsong_watch_loop() -> None:
+    """新歌首发每日巡检（设置里没开启时线程只是在空转比较整点）。
+
+    惰性 import：`newsong` 依赖任务队列所在的 pipeline，放在这里导入可以确保
+    配置自检（本模块顶部）已经跑完。
+    """
+    try:
+        from app import newsong
+        newsong.watch_loop(_stop_event)
+    except Exception as e:
+        logger.error('新歌首发巡检线程异常退出：%s', e, exc_info=True)
+
+
 from contextlib import asynccontextmanager                            # noqa: E402
 
 
@@ -164,6 +177,8 @@ async def lifespan(_app: FastAPI):
                      name='musicbot-startup').start()
     threading.Thread(target=_cookie_watch_loop, daemon=True,
                      name='musicbot-cookie-watch').start()
+    threading.Thread(target=_newsong_watch_loop, daemon=True,
+                     name='musicbot-newsong-watch').start()
     logger.info('=' * 58)
     try:
         yield

@@ -16,12 +16,15 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from app import cookies as cookie_store
+from app import newsong
 from app import notices
+from app import qq_web
 from app import songinfo
 from app import updater
-from app.config import (SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN, TASK_INTERVAL_MAX,
-                        TASK_INTERVAL_MIN, TASK_TIMEOUT_MAX, TASK_TIMEOUT_MIN,
-                        save_runtime_override, settings)
+from app.config import (NEWSONG_COUNT_MAX, NEWSONG_COUNT_MIN, NEWSONG_HOUR_MAX,
+                        NEWSONG_HOUR_MIN, SEARCH_LIMIT_MAX, SEARCH_LIMIT_MIN,
+                        TASK_INTERVAL_MAX, TASK_INTERVAL_MIN, TASK_TIMEOUT_MAX,
+                        TASK_TIMEOUT_MIN, save_runtime_override, settings)
 from app.downloader import build_target_path, download_and_report
 from app.login import manager as login_manager
 from app.pipeline import (KIND_BLIND, KIND_DOWNLOAD, KIND_SEARCH,
@@ -148,6 +151,10 @@ def _handle_command(raw: str, user: str) -> None:
         _handle_blind(args, state, user)
     elif command in ('match', '严格匹配', '严格'):
         _handle_match(args, state, user)
+    elif command in ('new', '新歌', '新歌首发'):
+        _handle_new(args, user)
+    elif command in ('album', '专辑'):
+        _handle_album(args, user)
     elif command in ('queue', '队列'):
         send_text(_queue_text(), user)
     elif command in ('cancel', '取消'):
@@ -327,6 +334,169 @@ def _handle_match(args: list[str], state: UserState, user: str) -> None:
         send_text(notices.match_mode_text(False), user)
     else:
         send_text('用法：/match on 或 /match off', user)
+
+
+def _handle_new(args: list[str], user: str) -> None:
+    """「新歌首发」自动查新与下载的设置（/new 系列）。
+
+    设置是**全局一份**（本机器人单人自用），并要求严格匹配下载 —— 见
+    `app/newsong.py` 的 `enqueue_strict_downloads`，这里不做任何模式开关。
+    """
+    if not args:
+        send_text(notices.newsong_status_text(newsong.get_settings(),
+                                              newsong.cache_size()), user)
+        return
+
+    action = args[0].strip()
+    rest = args[1:]
+    lowered = action.lower()
+
+    if lowered in ('on', '1', 'true', '开', '开启'):
+        # 记下是谁开的：之后新歌的通知与下载都发给他
+        newsong.update_settings(enabled=True, owner=user)
+        send_text(notices.newsong_toggle_text(True), user)
+        return
+    if lowered in ('off', '0', 'false', '关', '关闭'):
+        newsong.update_settings(enabled=False)
+        send_text(notices.newsong_toggle_text(False), user)
+        return
+
+    if lowered in ('count', '数量', 'num'):
+        if not rest:
+            send_text('用法：/new count all　或　/new count 5', user)
+            return
+        raw = rest[0].lower()
+        if raw in ('all', '全部', '所有', '*'):
+            newsong.update_settings(count=0)
+            send_text(notices.newsong_count_text(0), user)
+            return
+        try:
+            value = int(raw)
+        except ValueError:
+            send_text('请给一个数字或 all，例如 /new count 5', user)
+            return
+        if not NEWSONG_COUNT_MIN <= value <= NEWSONG_COUNT_MAX:
+            send_text(f'❌ 超出范围：只能是 {NEWSONG_COUNT_MIN}-{NEWSONG_COUNT_MAX}'
+                      f'（0 = 全部）', user)
+            return
+        newsong.update_settings(count=value)
+        send_text(notices.newsong_count_text(value), user)
+        return
+
+    if lowered in ('hour', '时间', '整点', '点'):
+        if not rest:
+            send_text('用法：/new hour 8（0-23，24 小时制整点）', user)
+            return
+        try:
+            value = int(rest[0])
+        except ValueError:
+            send_text('请给一个 0-23 的整数，例如 /new hour 8', user)
+            return
+        if not NEWSONG_HOUR_MIN <= value <= NEWSONG_HOUR_MAX:
+            send_text(f'❌ 超出范围：只能是 {NEWSONG_HOUR_MIN}-{NEWSONG_HOUR_MAX} 之间的整点', user)
+            return
+        newsong.update_settings(hour=value)
+        send_text(notices.newsong_hour_text(value), user)
+        return
+
+    if lowered in ('now', '现在', '立即', '马上'):
+        # 取歌要联网（6 个栏目 6 次请求），放到线程里，别让用户干等
+        threading.Thread(target=_newsong_scan_worker, args=(user,),
+                         daemon=True, name='musicbot-newsong-now').start()
+        send_text(notices.NEWSONG_SCANNING, user)
+        return
+
+    if lowered in ('test', '测试'):
+        count = int(rest[0]) if rest and rest[0].isdigit() else 3
+        threading.Thread(target=_newsong_test_worker, args=(user, max(1, count)),
+                         daemon=True, name='musicbot-newsong-test').start()
+        send_text(notices.NEWSONG_TESTING, user)
+        return
+
+    if lowered in ('reset', '重置', '清空'):
+        removed = newsong.reset_cache()
+        send_text(notices.NEWSONG_RESET_DONE.format(removed=removed) if removed
+                  else notices.NEWSONG_RESET_EMPTY, user)
+        return
+
+    # 栏目开关：/new 内地 on
+    if action in qq_web.DEBUT_TAB_NAMES:
+        if not rest:
+            send_text(f'用法：/new {action} on　或　/new {action} off', user)
+            return
+        value = rest[0].lower()
+        if value in ('on', '1', 'true', '开', '开启'):
+            newsong.set_tab(action, True)
+            send_text(notices.newsong_tab_text(action, True), user)
+        elif value in ('off', '0', 'false', '关', '关闭'):
+            newsong.set_tab(action, False)
+            send_text(notices.newsong_tab_text(action, False), user)
+        else:
+            send_text(f'用法：/new {action} on　或　/new {action} off', user)
+        return
+
+    send_text(notices.NEWSONG_USAGE, user)
+
+
+def _newsong_scan_worker(user: str) -> None:
+    """后台跑一轮查新（/new now）。"""
+    try:
+        report = newsong.scan(download=True)
+    except Exception as error:      # noqa: BLE001
+        logger.error('新歌首发手动检查失败：%s', error, exc_info=True)
+        send_text(notices.newsong_error_text(str(error)), user)
+        return
+    if report.errors and not report.tabs:
+        send_text(notices.newsong_error_text('；'.join(report.errors)), user)
+        return
+    if report.baseline:
+        send_text(notices.newsong_baseline_text(report.fetched, report.tab_text), user)
+        return
+    if report.queued:
+        return      # 入队时已经发过「发现 N 首」的回执
+    send_text(notices.newsong_done_text(report.fetched, report.note, report.tab_text), user)
+
+
+def _newsong_test_worker(user: str, count: int) -> None:
+    """后台跑「忽略历史、试下前 N 首」（/new test）。"""
+    try:
+        queued, errors, tabs = newsong.test_download(count, user)
+    except Exception as error:      # noqa: BLE001
+        logger.error('新歌首发试下失败：%s', error, exc_info=True)
+        send_text(notices.newsong_error_text(str(error)), user)
+        return
+    if queued == 0:
+        send_text(notices.newsong_error_text('；'.join(errors) or f'没取到歌曲（{tabs}）'), user)
+
+
+def _handle_album(args: list[str], user: str) -> None:
+    """批量下载专辑：/album <专辑链接或 mid>。"""
+    if not args:
+        send_text(notices.ALBUM_USAGE, user)
+        return
+    mid = qq_web.parse_album_mid(' '.join(args))
+    if not mid:
+        send_text(notices.ALBUM_BAD_LINK, user)
+        return
+    send_text(notices.ALBUM_FETCHING.format(mid=mid), user)
+    threading.Thread(target=_album_worker, args=(mid, user),
+                     daemon=True, name='musicbot-album').start()
+
+
+def _album_worker(mid: str, user: str) -> None:
+    """取专辑曲目并入队（严格匹配，每首按自己的歌名/歌手 + 专辑名校验）。"""
+    try:
+        info = qq_web.fetch_album(mid)
+    except Exception as error:      # noqa: BLE001
+        logger.error('获取专辑失败 %s：%s', mid, error, exc_info=True)
+        send_text(notices.ALBUM_FETCH_FAILED.format(reason=error), user)
+        return
+    if not info.songs:
+        send_text(notices.ALBUM_EMPTY.format(name=info.name), user)
+        return
+    newsong.enqueue_strict_downloads(info.songs, user,
+                                     notices.album_found_text(info.name, info.total),
+                                     label=f'专辑《{info.name}》')
 
 
 def _handle_update(args: list[str], user: str) -> None:
@@ -572,12 +742,18 @@ def _run_strict_blind(task: Task) -> None:
 
     不匹配就报「下载失败」，绝不退而求其次下个相似版本 —— 用户开严格模式
     就是为了避免下错歌。
+
+    批量自动下载（新歌首发 / 专辑）走这里时带 `silent` 与 `batch`：
+    成功不再逐条发消息，结果登记进批次由汇总统一回报。
     """
     outcome = _search(task, strict=True)
     if outcome is None:
+        # 搜索失败/无结果也要计入批次，否则汇总会永远等不到这一首
+        _note_batch(task, False, '搜索无结果')
         return
     matched = _match_all(task)
     if not matched:
+        _note_batch(task, False, '严格匹配未命中')
         send_text(notices.STRICT_DOWNLOAD_FAILED.format(
             keyword=task.title, criteria=task.title), task.user)
         return
@@ -588,8 +764,16 @@ def _run_strict_blind(task: Task) -> None:
         getattr(song, 'song_name', '') or '未知',
         getattr(song, 'singers', '') or '未知',
         str(getattr(song, 'ext', '') or 'mp3').lstrip('.'))
-    send_text(notices.start_download_text(title), task.user)
-    download_and_report(song, title, target, task.user)
+    if not task.silent:
+        send_text(notices.start_download_text(title), task.user)
+    download_and_report(song, title, target, task.user,
+                        silent=task.silent, batch=task.batch)
+
+
+def _note_batch(task: Task, ok: bool, reason: str = '') -> None:
+    """把「没走到下载那一步」的失败也计入批次汇总。"""
+    if task.batch:
+        newsong.record_result(task.batch, task.title, ok, reason)
 
 
 def _match_all(task: Task) -> list:
@@ -674,9 +858,13 @@ def _status_text(state: UserState) -> str:
         queue_line += f'，排队中 {len(waiting)} 条'
 
     check = updater.check()
+    newsong_state = newsong.get_settings()
     extra = [
         f'盲下载模式：{"已开启" if state.blind else "已关闭"}',
         f'严格匹配模式：{"已开启" if state.strict else "已关闭"}',
+        f'新歌首发每日查询：{"已开启" if newsong_state.get("enabled") else "已关闭"}'
+        f'（每天 {int(newsong_state.get("hour") or 0):02d}:00，'
+        f'{len(newsong_state.get("tabs") or [])} 个栏目，/new 可改）',
         f'搜索条数：{settings.search_limit}',
         f'任务间隔：{settings.task_interval_seconds} 秒'
         f'（/interval 可改）　单任务超时：{settings.task_timeout_minutes} 分钟'

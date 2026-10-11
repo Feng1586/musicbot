@@ -34,23 +34,44 @@ def format_size(size: int) -> str:
     return f'{value:.1f} GB'
 
 
-def download_and_report(song: Any, title: str, target_path: str, user: str) -> None:
+def download_and_report(song: Any, title: str, target_path: str, user: str, *,
+                        silent: bool = False, batch: str = '') -> None:
     """下载一首歌并回报用户。
 
     **失败也回消息、绝不抛异常** —— 队列 worker 靠这个保证流水线不会停住。
+
+    `silent=True`（批量自动下载）时**成功不再逐条发消息**，只登记到批次里，
+    由批次汇总统一回报；失败仍然立即上报 —— 那是要看的东西，不该被静音。
     """
     try:
         path, size = engine().download(song, target_path)
     except MusicEngineError as e:
         logger.error('下载失败 %s：%s', title, e)
+        _record_result(batch, title, False, str(e))
         send_text(notices.download_failed_text(title, str(e)), user)
         return
     except Exception as e:
         logger.error('下载异常 %s：%s', title, e, exc_info=True)
+        _record_result(batch, title, False, f'未预期的错误：{e}')
         send_text(notices.download_failed_text(title, f'未预期的错误：{e}'), user)
         return
 
+    _record_result(batch, title, True)
+    if silent:
+        return
     send_text(notices.download_done_text(os.path.basename(path), format_size(size)), user)
+
+
+def _record_result(batch: str, title: str, ok: bool, reason: str = '') -> None:
+    """把一首歌的结果登记到所属批次（没批次号就什么都不做）。"""
+    if not batch:
+        return
+    try:
+        # 惰性导入：newsong 会 import pipeline，模块级互相 import 会成环
+        from app import newsong
+        newsong.record_result(batch, title, ok, reason)
+    except Exception as e:      # noqa: BLE001 - 登记失败不该影响下载主流程
+        logger.debug('登记批量下载结果失败：%s', e)
 
 
 def build_target_path(source_id: str, keyword: str, song_name: str,

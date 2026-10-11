@@ -67,9 +67,23 @@ _HELP_PAGE_1 = """📖 musicbot 使用帮助（1/2）
              且搜索结果歌名/歌手/专辑完全一致才会下载
 /match off   关闭（未开启时若按该格式发送，会自动整理成精准关键词搜索）
 
-发送 /help 2 查看第 2 页（登录 / 队列 / 状态 / 升级）"""
+发送 /help 2 查看第 2 页（新歌首发 / 专辑批量下载 / 登录 / 队列 / 状态）"""
 
 _HELP_PAGE_2 = """📖 musicbot 使用帮助（2/2）
+
+【新歌首发】自动查新并下载
+/new                查看设置
+/new on | off       开关「每天自动查询」
+/new 最新 on|off    单栏目开关：最新/内地/港台/欧美/韩国/日本
+/new count all|5    每次自动下载数量（all = 全部）
+/new hour 8         每天几点查（0-23，整点）
+/new now            立刻查一次
+/new test 3         忽略历史，把当前前 3 首试下（验证用）
+/new reset          清空历史（下次重建基线）
+
+【专辑批量下载】
+/album <专辑链接>   下载该专辑全部歌曲（严格匹配）
+例如：/album https://y.qq.com/n/ryqq_v2/albumDetail/0041WVfh2vtlJE
 
 【Cookie】
 /qq login     扫码登录 / 更新 QQ音乐 Cookie
@@ -418,6 +432,127 @@ RESTART_NOTICE = '🔄 正在重启服务…（约 10 秒后可用）'
 RESTART_NO_SOCKET = ('🔄 未挂载 docker.sock，将以退出进程的方式重启。\n'
                      '若容器没配置自动重启策略（restart: unless-stopped / always），'
                      '服务会停在停止状态，需要手动启动容器。')
+
+
+# --- 新歌首发 / 专辑批量下载 -------------------------------------------------
+
+NEWSONG_SCANNING = '🔍 正在检查新歌首发，结果稍后发给你…'
+NEWSONG_TESTING = '🔍 正在按当前栏目取歌并试下，稍后回报…'
+NEWSONG_RESET_DONE = '🧹 已清空新歌历史（{removed} 条）。下次检查会重新建立基线，不会下载。'
+NEWSONG_RESET_EMPTY = '新歌历史上本来就是空的，无需清空'
+
+NEWSONG_USAGE = """用法：
+/new                    查看当前设置
+/new on | off           开关「每天自动查询新歌」
+/new 最新 on|off        单栏目开关（最新/内地/港台/欧美/韩国/日本）
+/new count all|5        每次自动下载数量（all = 全部）
+/new hour 8             每天几点查（0-23，整点）
+/new now                立刻查一次
+/new test 3             忽略历史，把当前前 3 首试下（验证用，不写历史）
+/new reset              清空历史（下次重建基线）"""
+
+ALBUM_USAGE = ('用法：/album <专辑链接>\n'
+               '例如：/album https://y.qq.com/n/ryqq_v2/albumDetail/0041WVfh2vtlJE')
+ALBUM_BAD_LINK = ('❌ 没认出专辑地址。请发 QQ音乐专辑页链接，例如：\n'
+                  'https://y.qq.com/n/ryqq_v2/albumDetail/0041WVfh2vtlJE')
+ALBUM_FETCHING = '⏳ 正在获取专辑《{mid}》的曲目…'
+ALBUM_FETCH_FAILED = '❌ 获取专辑失败：{reason}'
+ALBUM_EMPTY = '❌ 专辑《{name}》里没取到曲目'
+
+
+def newsong_toggle_text(enabled: bool) -> str:
+    if enabled:
+        return ('✅ 已开启「每天自动查询新歌首发」。\n'
+                '到设定整点会检查各已启用栏目，只下载**新增**的歌（严格匹配）。\n'
+                '首次运行只登记不下载，从第二次开始才下增量。\n'
+                '用 /new 查看设置，/new now 立刻查一次。')
+    return '⏹️ 已关闭「每天自动查询新歌首发」（历史记录保留，重新开启后不会重下旧歌）'
+
+
+def newsong_tab_text(name: str, enabled: bool) -> str:
+    return f'✅ 栏目「{name}」已{"开启" if enabled else "关闭"}'
+
+
+def newsong_count_text(value: int) -> str:
+    return (f'✅ 每次自动下载「全部」新歌' if value <= 0
+            else f'✅ 每次自动下载最多 {value} 首新歌')
+
+
+def newsong_hour_text(hour: int) -> str:
+    return f'✅ 已设为每天 {hour:02d}:00 检查新歌首发'
+
+
+def newsong_status_text(settings: dict, cache_size: int) -> str:
+    tabs = settings.get('tabs') or []
+    all_tabs = ('最新', '内地', '港台', '欧美', '韩国', '日本')
+    tab_line = '、'.join(f'{t}{"✓" if t in tabs else "✗"}' for t in all_tabs)
+    count = int(settings.get('count') or 0)
+    lines = [
+        '🎵 新歌首发自动下载',
+        f'状态：{"已开启" if settings.get("enabled") else "已关闭"}',
+        f'栏目：{tab_line}',
+        f'数量：{"全部" if count <= 0 else f"每次最多 {count} 首"}',
+        f'时间：每天 {int(settings.get("hour") or 0):02d}:00',
+        f'历史：已记录 {cache_size} 首（用于判断哪些是新增）',
+        '匹配：锁定严格匹配（歌名/歌手/专辑完全一致才下载）',
+    ]
+    last_date = settings.get('last_date') or ''
+    if last_date:
+        lines.append(f'上次检查：{last_date}')
+    lines += ['', '修改：/new on|off、/new 内地 on、/new count 5、/new hour 8',
+              '立刻查：/new now　试下：/new test 3']
+    return _clip('\n'.join(lines))
+
+
+def newsong_found_text(count: int, total: int, tabs: str) -> str:
+    head = f'🎵 新歌首发有 {total} 首新增'
+    if count < total:
+        head += f'，本次按设置下载前 {count} 首'
+    return (f'{head}\n栏目：{tabs}\n'
+            '已加入下载队列（严格匹配：歌名/歌手/专辑完全一致才下）')
+
+
+def newsong_test_text(count: int, tabs: str) -> str:
+    return (f'🧪 测试：已把当前前 {count} 首加入下载队列（严格匹配）\n'
+            f'栏目：{tabs}\n注意：本次不计入历史，下次自动检查仍会当作新歌处理')
+
+
+def newsong_baseline_text(fetched: int, tabs: str) -> str:
+    return (f'📌 已为「新歌首发」建立基线：{fetched} 首\n'
+            f'栏目：{tabs}\n'
+            '本次**不下载**（这些不是新歌）。从下次检查开始只下载新增的歌曲。')
+
+
+def newsong_error_text(reason: str) -> str:
+    return f'⚠️ 新歌首发本轮检查失败：{reason}'
+
+
+def newsong_done_text(fetched: int, note: str, tabs: str) -> str:
+    """手动 /new now 的「检查完成」回执（有新歌时入队那步已经发过了）。"""
+    if note:
+        return f'✅ 检查完成：{note}（本轮取到 {fetched} 首）'
+    return f'✅ 检查完成：本轮取到 {fetched} 首，没有新增新歌\n栏目：{tabs}'
+
+
+def album_found_text(name: str, count: int) -> str:
+    return (f'💿 专辑《{name}》共取到 {count} 首，已全部加入下载队列\n'
+            '严格匹配：每首都按自己的歌名/歌手 + 专辑名校验，完全一致才下')
+
+
+def batch_summary_text(label: str, total: int, ok: int, failed: list[str]) -> str:
+    """批量下载的结束汇总（逐条成功消息被 silent 静音，靠这条交代结果）。"""
+    head = f'🏁 {label}下载结束：共 {total} 首，成功 {ok} 首'
+    if failed:
+        head += f'，失败 {len(failed)} 首'
+    lines = [head]
+    if failed:
+        lines.append('失败清单（严格匹配没找到完全一致的版本）：')
+        lines += [f'· {name}' for name in failed[:20]]
+        if len(failed) > 20:
+            lines.append(f'… 其余 {len(failed) - 20} 首见上方逐条失败提示')
+    else:
+        lines.append('全部下载成功 ✅')
+    return _clip('\n'.join(lines))
 
 
 # --- 通用 -------------------------------------------------------------------

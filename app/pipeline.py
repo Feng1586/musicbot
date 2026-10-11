@@ -78,6 +78,12 @@ class Task:
     # worker 搜完后据此判断结果是否严格一致。None 表示不启用严格匹配。
     strict: bool = False
     fields: Any = None
+    # 批量自动下载（新歌首发 / 专辑）用：
+    # * silent —— 不再逐首发「开始下载/下载完成」，只在结束时发一条汇总
+    #   （一次下几十首时否则会刷出上百条消息）；失败仍然逐条立即上报。
+    # * batch  —— 归属的批次号，用于汇总计数（见 app/newsong.py 的批次登记）。
+    silent: bool = False
+    batch: str = ''
     queued_at: float = 0.0
     seq: int = 0
 

@@ -27,6 +27,11 @@ TASK_INTERVAL_MIN, TASK_INTERVAL_MAX = 0, 60        # 秒
 # 单任务超时：一条任务超过这个时长就当它卡住了，放弃等待并处理下一个。
 TASK_TIMEOUT_MIN, TASK_TIMEOUT_MAX = 1, 10          # 分钟
 
+# 新歌首发（/new 系列）与专辑批量下载
+NEWSONG_HOUR_MIN, NEWSONG_HOUR_MAX = 0, 23          # 每天触发的整点（24 小时制）
+NEWSONG_COUNT_MIN, NEWSONG_COUNT_MAX = 0, 500       # 0 = 每次把新歌全部下完
+ALBUM_TRACKS_MIN, ALBUM_TRACKS_MAX = 1, 500         # 单张专辑一次最多排队多少首
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -105,6 +110,13 @@ class Settings:
         self.task_timeout_minutes = _env_int('MUSICBOT_TASK_TIMEOUT_MINUTES', 5,
                                              minimum=TASK_TIMEOUT_MIN,
                                              maximum=TASK_TIMEOUT_MAX)
+
+        # --- 新歌首发 / 专辑批量下载 ---
+        # 单张专辑一次最多排队多少首。QQ 接口本身能拿全（网页只请求前 10 首），
+        # 这个上限只是防止极端专辑一次往队列里塞太多。
+        self.album_max_tracks = _env_int('MUSICBOT_ALBUM_MAX_TRACKS', 50,
+                                         minimum=ALBUM_TRACKS_MIN,
+                                         maximum=ALBUM_TRACKS_MAX)
 
         # --- 路径与运维 ---
         self.data_dir = _env_str('MUSICBOT_DATA_DIR', os.path.join(PROJECT_ROOT, 'data'))

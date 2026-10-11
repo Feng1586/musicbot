@@ -11,6 +11,11 @@ logs/
 .wb_*
 .wb-*
 
+# 抓包文件：y.qq.com.har 有 38MB 且**含真实 Cookie**，绝不能入库。
+# （2026-10-12 用户放进项目根目录用来分析接口，分析完就该排除掉）
+*.har
+*.har.zip
+
 # Python
 __pycache__/
 *.py[cod]
